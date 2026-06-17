@@ -178,7 +178,7 @@ app.post("/webhook", async (req, res) => {
   if (type === "call.answered" && directCallPending && directCallPending.leadCcid && ccid === directCallPending.leadCcid) {
     console.log("Direct bridge: lead answered! Bridging with Sean:", directCallPending.seanCcid);
     const bridgeResult = await action(ccid, "bridge", {
-      call_control_id_to_bridge_with: directCallPending.seanCcid,
+      call_control_id: directCallPending.seanCcid,
     });
     console.log("Bridge result:", JSON.stringify(bridgeResult));
     directCallPending = null;
@@ -237,7 +237,7 @@ app.post("/webhook", async (req, res) => {
         console.log("Human detected! Bridging", ccid, "to Sean:", session.seanCallId);
         // Direct bridge — connects Sean's call audio to this lead's call audio
         await action(ccid, "bridge", {
-          call_control_id_to_bridge_with: session.seanCallId,
+          call_control_id: session.seanCallId,
         });
         for (const [otherId, other] of batch.lines) {
           if (otherId !== ccid && (other.status === "dialing" || other.status === "ringing")) {

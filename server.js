@@ -1,5 +1,5 @@
 /* ============================================================================
-   THE SWITCHBOARD v3.2 — backend orchestrator
+   THE SWITCHBOARD v3.4 — backend orchestrator
    - Parallel outbound dialing with AMD
    - Custom voicemail drop (YOUR recorded voice, not TTS)
    - Inbound call forwarding (callbacks reach your phone)
@@ -95,13 +95,16 @@ app.post("/dial-batch", async (req, res) => {
   const mkt = (market || DEFAULT_MARKET).toUpperCase();
   const batchId = "b_" + Date.now().toString(36);
 
-  if (session.seanUp && session.confName) {
+  // If Sean is already on the line from a previous batch, just fire leads directly
+  if (session.seanUp && session.seanCallId) {
+    console.log("Sean already on line, firing leads directly");
     await fireBatch(batchId, leads, mkt);
     return res.json({ batchId });
   }
 
+  // Otherwise, call Sean's phone first
   session.pending = { batchId, leads, market: mkt };
-  session.confName = "switchboard_" + Date.now().toString(36);
+  console.log("Calling Sean's phone:", myPhone);
   const call = await telnyx("/calls", {
     connection_id: CONNECTION_ID,
     to: myPhone,
@@ -120,17 +123,42 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET) {
 
   await Promise.all(leads.slice(0, 10).map(async (ld) => {
     const from = pickFrom();
-    const call = await telnyx("/calls", {
-      connection_id: CONNECTION_ID,
-      to: ld.to,
-      from,
-      webhook_url: `${PUBLIC_URL}/webhook`,
-      answering_machine_detection: "premium",
-      client_state: b64({ batchId, leadId: ld.leadId }),
-    });
-    const ccid = call?.data?.call_control_id;
-    if (ccid) lines.set(ccid, { leadId: ld.leadId, to: ld.to, status: "dialing", attempt: ld.attempt || 0, fromNumber: from });
+    try {
+      const call = await telnyx("/calls", {
+        connection_id: CONNECTION_ID,
+        to: ld.to,
+        from,
+        webhook_url: `${PUBLIC_URL}/webhook`,
+        answering_machine_detection: "premium",
+        client_state: b64({ batchId, leadId: ld.leadId }),
+      });
+      const ccid = call?.data?.call_control_id;
+      if (ccid) {
+        lines.set(ccid, { leadId: ld.leadId, to: ld.to, status: "dialing", attempt: ld.attempt || 0, fromNumber: from });
+      } else {
+        // Call creation failed — no call ID returned
+        console.log("Call failed for", ld.to, "— no call ID");
+      }
+    } catch (e) {
+      console.log("Call error for", ld.to, ":", e.message);
+    }
   }));
+
+  // If no lines were created (all calls failed), mark batch as done immediately
+  if (lines.size === 0) {
+    const batch = batches.get(batchId);
+    if (batch) batch.done = true;
+    console.log("Batch", batchId, "— all calls failed, marking done");
+  }
+
+  // Safety timeout: mark batch done after 30 seconds if it hasn't resolved
+  setTimeout(() => {
+    const batch = batches.get(batchId);
+    if (batch && !batch.done) {
+      batch.done = true;
+      console.log("Batch", batchId, "— timed out, marking done");
+    }
+  }, 30000);
 }
 
 // ============================================================================
@@ -398,4 +426,4 @@ app.get("/health", (_req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.2 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.4 backend listening on :${PORT}`));

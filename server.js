@@ -51,7 +51,13 @@ async function telnyx(path, body, method = "POST") {
   });
   const text = await res.text();
   let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) console.error("Telnyx error", res.status, path, text.slice(0, 400));
+  if (!res.ok) {
+    // Hanging up an already-ended call (90018) is expected/harmless noise when
+    // we tidy up losing lines after a bridge. Don't spam the logs with it.
+    const code = json?.errors?.[0]?.code;
+    const isHarmlessHangup = path.endsWith("/hangup") && (code === "90018" || /already ended/i.test(text));
+    if (!isHarmlessHangup) console.error("Telnyx error", res.status, path, text.slice(0, 400));
+  }
   return json;
 }
 
@@ -95,10 +101,19 @@ app.post("/dial-batch", async (req, res) => {
   const mkt = (market || DEFAULT_MARKET).toUpperCase();
   const batchId = "b_" + Date.now().toString(36);
 
-  // If Sean is already on the line from a previous batch, just fire leads directly
+  // If Sean is already on the line from a previous batch, just fire leads directly.
   if (session.seanUp && session.seanCallId) {
     console.log("Sean already on line, firing leads directly");
     await fireBatch(batchId, leads, mkt);
+    return res.json({ batchId });
+  }
+
+  // If a call to Sean's phone is already in flight (seanCallId set but not yet
+  // answered), don't dial him again — queue these leads to fire when he answers.
+  if (session.seanCallId && !session.seanUp) {
+    console.log("Sean's phone already ringing — queueing leads for when he answers");
+    session.pending = { batchId, leads, market: mkt };
+    batches.set(batchId, { lines: new Map(), connected: false, done: false, market: mkt });
     return res.json({ batchId });
   }
 
@@ -237,14 +252,29 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
-  // ---- YOUR leg hung up -> reset session
+  // ---- YOUR leg hung up -> end session ONLY if it was a real hangup by you,
+  //      not a bridged lead dropping. Verify your leg is actually gone before
+  //      tearing down, so one rude lead can't kill your whole session.
   if (type === "call.hangup" && ccid === session.seanCallId) {
+    const cause = (p.hangup_cause || "").toLowerCase();
+    const source = (p.hangup_source || "").toLowerCase();
+    // If the bridged lead hung up, Telnyx may end our leg with cause
+    // "normal_clearing" sourced from the callee/bridge — in that case we
+    // do NOT reset; Sean is still holding his phone and ready for next batch.
+    console.log("Sean-leg hangup. cause:", cause, "source:", source);
+    if (source === "callee" || source === "bridge") {
+      console.log("Lead-side drop of bridged leg — keeping session alive.");
+      // mark any active batch line done, but leave session.seanUp intact
+      return;
+    }
+    // Genuine end-of-session: Sean hung up his own phone.
     if (session.pending) {
       const b = batches.get(session.pending.batchId);
       if (b) b.done = true;
     }
     session.confId = session.confName = session.seanCallId = null;
     session.seanUp = false; session.pending = null;
+    console.log("Session ended — Sean hung up his phone.");
     return;
   }
 
@@ -309,7 +339,12 @@ app.post("/webhook", async (req, res) => {
     }
 
     case "call.hangup":
+      // A LEAD line ended. This must NEVER affect Sean's session.
       if (line && line.status !== "connected") line.status = line.status || "dropped";
+      if (line && line.status === "connected") {
+        line.status = "ended";
+        console.log("Lead hung up after talking — session stays live for next batch.");
+      }
       if (![...batch.lines.values()].some(l => l.status === "dialing" || l.status === "ringing"))
         batch.done = true;
       break;
@@ -442,4 +477,4 @@ app.get("/health", (_req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.4.1 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.4.2 backend listening on :${PORT}`));

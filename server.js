@@ -1,5 +1,5 @@
 /* ============================================================================
-   THE SWITCHBOARD v3.0 — backend orchestrator
+   THE SWITCHBOARD v3.1 — backend orchestrator
    - Parallel outbound dialing with AMD
    - Custom voicemail drop (YOUR recorded voice, not TTS)
    - Inbound call forwarding (callbacks reach your phone)
@@ -213,7 +213,7 @@ app.post("/webhook", async (req, res) => {
         console.log("Human detected! Bridging", ccid, "to Sean:", session.seanCallId);
         // Direct bridge — connects Sean's call audio to this lead's call audio
         await action(ccid, "bridge", {
-          call_control_id: session.seanCallId,
+          call_control_id_to_bridge_with: session.seanCallId,
         });
         for (const [otherId, other] of batch.lines) {
           if (otherId !== ccid && (other.status === "dialing" || other.status === "ringing")) {
@@ -351,4 +351,4 @@ app.get("/health", (_req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.0 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.1 backend listening on :${PORT}`));

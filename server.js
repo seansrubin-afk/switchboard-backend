@@ -1,5 +1,5 @@
 /* ============================================================================
-   THE SWITCHBOARD v3.1 — backend orchestrator
+   THE SWITCHBOARD v3.2 — backend orchestrator
    - Parallel outbound dialing with AMD
    - Custom voicemail drop (YOUR recorded voice, not TTS)
    - Inbound call forwarding (callbacks reach your phone)
@@ -161,6 +161,28 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
+  // ---- DIRECT CALL: your phone answered → dial the lead and bridge immediately (no AMD) ----
+  if (type === "call.answered" && state.direct) {
+    console.log("Direct call: you answered, now dialing lead", state.directTo);
+    const call2 = await telnyx("/calls", {
+      connection_id: CONNECTION_ID, to: state.directTo, from: state.directFrom || FROM_NUMBERS[0],
+      webhook_url: `${PUBLIC_URL}/webhook`,
+      client_state: b64({ directBridge: true, bridgeWith: ccid }),
+    });
+    console.log("Direct call: lead dial response", call2?.data?.call_control_id || "FAILED");
+    return;
+  }
+
+  // ---- DIRECT BRIDGE: lead answered → bridge with Sean immediately ----
+  if (type === "call.answered" && state.directBridge) {
+    console.log("Direct bridge: lead answered, bridging with", state.bridgeWith);
+    const bridgeResult = await action(ccid, "bridge", {
+      call_control_id_to_bridge_with: state.bridgeWith,
+    });
+    console.log("Bridge result:", JSON.stringify(bridgeResult));
+    return;
+  }
+
   // ---- CALLBACK: your phone answered a call-back → now dial the lead ----
   if (type === "call.answered" && state.callback) {
     // Bridge: transfer this call to the lead
@@ -273,6 +295,25 @@ app.post("/messaging", (req, res) => {
 });
 
 // ============================================================================
+//  DIRECT CALL — bridge without AMD (for testing audio)
+// ============================================================================
+app.post("/direct-call", async (req, res) => {
+  const { myPhone, to } = req.body || {};
+  if (!myPhone || !to) return res.status(400).json({ error: "need myPhone and to" });
+  const from = FROM_NUMBERS[0] || "";
+  try {
+    // Call your phone
+    console.log("Direct call: calling your phone", myPhone);
+    const call1 = await telnyx("/calls", {
+      connection_id: CONNECTION_ID, to: myPhone, from,
+      webhook_url: `${PUBLIC_URL}/webhook`,
+      client_state: b64({ direct: true, directTo: to, directFrom: from }),
+    });
+    res.json({ ok: true, callId: call1?.data?.call_control_id });
+  } catch (e) { console.error("Direct call error:", e); res.status(500).json({ error: e.message }); }
+});
+
+// ============================================================================
 //  CALL BACK & TEXT — use the SAME Telnyx number they saw
 // ============================================================================
 app.post("/call-back", async (req, res) => {
@@ -351,4 +392,4 @@ app.get("/health", (_req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.1 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.2 backend listening on :${PORT}`));

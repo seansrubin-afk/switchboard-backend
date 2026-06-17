@@ -161,25 +161,27 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
-  // ---- DIRECT CALL: your phone answered → dial the lead and bridge immediately (no AMD) ----
-  if (type === "call.answered" && state.direct) {
-    console.log("Direct call: you answered, now dialing lead", state.directTo);
+  // ---- DIRECT CALL: your phone answered → dial the lead immediately (using session state) ----
+  if (type === "call.answered" && directCallPending && ccid === directCallPending.seanCcid) {
+    console.log("Direct call: you answered! Now dialing lead", directCallPending.to);
     const call2 = await telnyx("/calls", {
-      connection_id: CONNECTION_ID, to: state.directTo, from: state.directFrom || FROM_NUMBERS[0],
+      connection_id: CONNECTION_ID, to: directCallPending.to, from: directCallPending.from || FROM_NUMBERS[0],
       webhook_url: `${PUBLIC_URL}/webhook`,
-      client_state: b64({ directBridge: true, bridgeWith: ccid }),
     });
-    console.log("Direct call: lead dial response", call2?.data?.call_control_id || "FAILED");
+    const leadCcid = call2?.data?.call_control_id;
+    console.log("Direct call: lead call ID =", leadCcid || "FAILED");
+    if (leadCcid) directCallPending.leadCcid = leadCcid;
     return;
   }
 
   // ---- DIRECT BRIDGE: lead answered → bridge with Sean immediately ----
-  if (type === "call.answered" && state.directBridge) {
-    console.log("Direct bridge: lead answered, bridging with", state.bridgeWith);
+  if (type === "call.answered" && directCallPending && directCallPending.leadCcid && ccid === directCallPending.leadCcid) {
+    console.log("Direct bridge: lead answered! Bridging with Sean:", directCallPending.seanCcid);
     const bridgeResult = await action(ccid, "bridge", {
-      call_control_id_to_bridge_with: state.bridgeWith,
+      call_control_id_to_bridge_with: directCallPending.seanCcid,
     });
     console.log("Bridge result:", JSON.stringify(bridgeResult));
+    directCallPending = null;
     return;
   }
 
@@ -297,19 +299,23 @@ app.post("/messaging", (req, res) => {
 // ============================================================================
 //  DIRECT CALL — bridge without AMD (for testing audio)
 // ============================================================================
+let directCallPending = null;
+
 app.post("/direct-call", async (req, res) => {
   const { myPhone, to } = req.body || {};
   if (!myPhone || !to) return res.status(400).json({ error: "need myPhone and to" });
   const from = FROM_NUMBERS[0] || "";
+  directCallPending = null;
   try {
-    // Call your phone
-    console.log("Direct call: calling your phone", myPhone);
+    console.log("Direct call: calling your phone", myPhone, "then will dial", to);
     const call1 = await telnyx("/calls", {
       connection_id: CONNECTION_ID, to: myPhone, from,
       webhook_url: `${PUBLIC_URL}/webhook`,
-      client_state: b64({ direct: true, directTo: to, directFrom: from }),
     });
-    res.json({ ok: true, callId: call1?.data?.call_control_id });
+    const ccid = call1?.data?.call_control_id;
+    directCallPending = { seanCcid: ccid, to, from };
+    console.log("Direct call: your call ID =", ccid);
+    res.json({ ok: true, callId: ccid });
   } catch (e) { console.error("Direct call error:", e); res.status(500).json({ error: e.message }); }
 });
 

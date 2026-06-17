@@ -1,5 +1,5 @@
 /* ============================================================================
-   THE SWITCHBOARD v3.0 â€” backend orchestrator
+   THE SWITCHBOARD v3.0 — backend orchestrator
    - Parallel outbound dialing with AMD
    - Custom voicemail drop (YOUR recorded voice, not TTS)
    - Inbound call forwarding (callbacks reach your phone)
@@ -145,7 +145,7 @@ app.post("/webhook", async (req, res) => {
   const ccid = p.call_control_id;
   const state = p.client_state ? unb64(p.client_state) : {};
 
-  // ---- INBOUND CALL â€” forward to your phone ----
+  // ---- INBOUND CALL — forward to your phone ----
   if (type === "call.initiated" && p.direction === "incoming") {
     const from = p.from || p.caller_id_name || "unknown";
     const to = p.to || "";
@@ -161,21 +161,17 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
-  // ---- CALLBACK: your phone answered a call-back â†’ now dial the lead ----
+  // ---- CALLBACK: your phone answered a call-back → now dial the lead ----
   if (type === "call.answered" && state.callback) {
     // Bridge: transfer this call to the lead
     await action(ccid, "transfer", { to: state.callbackTo, from: state.callbackFrom || FROM_NUMBERS[0] });
     return;
   }
 
-  // ---- YOUR leg answered -> open the conference, then fire any pending batch
+  // ---- YOUR leg answered -> store your call ID, then fire any pending batch
   if (type === "call.answered" && ccid === session.seanCallId) {
-    const conf = await telnyx("/conferences", {
-      name: session.confName,
-      call_control_id: ccid,
-    });
-    session.confId = conf?.data?.id || null;
     session.seanUp = true;
+    console.log("Sean answered, call ID:", ccid);
     if (session.pending) {
       const { batchId, leads, market } = session.pending;
       session.pending = null;
@@ -214,8 +210,10 @@ app.post("/webhook", async (req, res) => {
       if (isHuman && !batch.connected) {
         batch.connected = true;
         if (line) line.status = "connected";
-        await telnyx(`/conferences/${session.confId}/actions/join`, {
-          call_control_id: ccid,
+        console.log("Human detected! Bridging", ccid, "to Sean:", session.seanCallId);
+        // Direct bridge — connects Sean's call audio to this lead's call audio
+        await action(ccid, "bridge", {
+          call_control_id: session.seanCallId,
         });
         for (const [otherId, other] of batch.lines) {
           if (otherId !== ccid && (other.status === "dialing" || other.status === "ringing")) {
@@ -228,14 +226,14 @@ app.post("/webhook", async (req, res) => {
         action(ccid, "hangup").catch(() => {});
       } else if (isMachine) {
         if (line) line.status = "machine";
-        // Only leave a voicemail on the FIRST attempt â€” never spam the same person
+        // Only leave a voicemail on the FIRST attempt — never spam the same person
         if (voicemailAudio && PUBLIC_URL && line && (line.attempt || 0) === 0) {
           await action(ccid, "playback_start", {
             audio_url: `${PUBLIC_URL}/voicemail.mp3`,
           });
           setTimeout(() => action(ccid, "hangup").catch(() => {}), 15000);
         } else {
-          // Second/third attempt or no voicemail â€” hang up silently
+          // Second/third attempt or no voicemail — hang up silently
           action(ccid, "hangup").catch(() => {});
         }
       }
@@ -275,7 +273,7 @@ app.post("/messaging", (req, res) => {
 });
 
 // ============================================================================
-//  CALL BACK & TEXT â€” use the SAME Telnyx number they saw
+//  CALL BACK & TEXT — use the SAME Telnyx number they saw
 // ============================================================================
 app.post("/call-back", async (req, res) => {
   const { myPhone, to, fromNumber } = req.body || {};
@@ -293,7 +291,7 @@ app.post("/call-back", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Handle callback bridge â€” when your phone answers, dial the lead
+// Handle callback bridge — when your phone answers, dial the lead
 app.post("/webhook-callback-bridge", async (req, res) => {
   // This is handled in the main webhook below
   res.sendStatus(200);

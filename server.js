@@ -205,6 +205,11 @@ app.post("/webhook", async (req, res) => {
   // ---- DIRECT BRIDGE: lead answered → bridge with Sean immediately ----
   if (type === "call.answered" && directCallPending && directCallPending.leadCcid && ccid === directCallPending.leadCcid) {
     console.log("Direct bridge: lead answered! Bridging with Sean:", directCallPending.seanCcid);
+    if (!directCallPending.seanCcid) {
+      console.error("DIRECT BRIDGE ABORTED — seanCcid is blank.");
+      directCallPending = null;
+      return;
+    }
     const bridgeResult = await action(ccid, "bridge", {
       call_control_id: directCallPending.seanCcid,
     });
@@ -263,10 +268,21 @@ app.post("/webhook", async (req, res) => {
         batch.connected = true;
         if (line) line.status = "connected";
         console.log("Human detected! Bridging", ccid, "to Sean:", session.seanCallId);
+        // Guard: never fire a bridge with a blank target (the v3.2 422 bug)
+        if (!session.seanCallId) {
+          console.error("BRIDGE ABORTED — session.seanCallId is blank. Sean's leg is not up.");
+          batch.connected = false;
+          break;
+        }
         // Direct bridge — connects Sean's call audio to this lead's call audio
-        await action(ccid, "bridge", {
+        const bridgeResult = await action(ccid, "bridge", {
           call_control_id: session.seanCallId,
         });
+        if (bridgeResult?.errors) {
+          console.error("BRIDGE FAILED:", JSON.stringify(bridgeResult.errors));
+        } else {
+          console.log("Bridge OK — Sean connected to lead", ccid);
+        }
         for (const [otherId, other] of batch.lines) {
           if (otherId !== ccid && (other.status === "dialing" || other.status === "ringing")) {
             other.status = "dropped";
@@ -426,4 +442,4 @@ app.get("/health", (_req, res) => res.json({
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.4 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.4.1 backend listening on :${PORT}`));

@@ -432,10 +432,8 @@ app.post("/webhook", async (req, res) => {
   //      real person is on the line before any lead is ever connected.
   if (type === "call.answered" && ccid === session.seanCallId && state.seanHold) {
     console.log("Sean's phone answered — confirming human with keypress.");
-    // Telnyx requires the call to be answered before gather_using_speak. For an
-    // outbound call this is normally implicit when Sean picks up, but we issue
-    // answer defensively so the prompt can never silently fail.
-    await action(ccid, "answer", {}).catch(() => {});
+    // No 'answer' command here — Telnyx rejects answering an OUTBOUND call (the
+    // call is already answered when Sean picks up). Go straight to the prompt.
     await action(ccid, "gather_using_speak", {
       payload: "Press any key to start your session.",
       voice: "female",
@@ -725,6 +723,26 @@ app.get("/session/status", (_req, res) => {
   });
 });
 
+// ---- DROP CURRENT LEAD (keep Sean on the line) ----
+// Hangs up whatever lead is currently connected to Sean, WITHOUT ending Sean's
+// session. Sean stays held in the conference, ready for the next lead.
+app.post("/drop-lead", async (req, res) => {
+  let dropped = 0;
+  for (const batch of batches.values()) {
+    for (const [ccid, l] of batch.lines) {
+      if (l.status === "connected" && !String(ccid).startsWith("blocked_")) {
+        action(ccid, "hangup").catch(() => {});
+        l.status = "ended";
+        dropped++;
+      }
+    }
+    // free the slot so the next lead can connect / next batch can fire
+    batch.connected = false;
+  }
+  console.log("Dropped current lead(s):", dropped, "— Sean stays on the line.");
+  res.json({ ok: true, dropped });
+});
+
 // ---- NUMBER MANAGEMENT (live, syncs the dialer's rotation) ----
 app.get("/numbers", (_req, res) => {
   res.json({ numbers: FROM_NUMBERS, reputation: numberReputation() });
@@ -768,4 +786,4 @@ app.get("/health", async (_req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.7.1 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.7.2 backend listening on :${PORT}`));

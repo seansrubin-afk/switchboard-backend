@@ -52,6 +52,28 @@ const session = { confId: null, confName: null, seanCallId: null, seanUp: false,
 const batches = new Map();
 let rrIndex = 0;
 
+// ---- BACKEND-ENFORCED CALL SAFETY (never trust the frontend) ----
+// Hard caps so no business can ever be called repeatedly, regardless of any
+// frontend bug, auto-dial loop, or duplicate lead in the queue.
+const MAX_ATTEMPTS_PER_NUMBER = 3;        // absolute max calls to one number, ever, per server run
+const MIN_SECONDS_BETWEEN_CALLS = 90;     // a number cannot be re-dialed within this window
+const callHistory = {};                   // { "+1leadphone": { attempts, lastCalledAt } }
+function canCall(toNumber) {
+  const h = callHistory[toNumber];
+  if (!h) return { ok: true };
+  if (h.attempts >= MAX_ATTEMPTS_PER_NUMBER)
+    return { ok: false, reason: `max ${MAX_ATTEMPTS_PER_NUMBER} attempts reached` };
+  const since = (Date.now() - (h.lastCalledAt || 0)) / 1000;
+  if (since < MIN_SECONDS_BETWEEN_CALLS)
+    return { ok: false, reason: `called ${Math.round(since)}s ago (min ${MIN_SECONDS_BETWEEN_CALLS}s)` };
+  return { ok: true };
+}
+function recordCallAttempt(toNumber) {
+  const h = callHistory[toNumber] || { attempts: 0, lastCalledAt: 0 };
+  h.attempts += 1; h.lastCalledAt = Date.now();
+  callHistory[toNumber] = h;
+}
+
 // Voicemail audio (uploaded by user, stored in memory)
 let voicemailAudio = null; // { buffer: Buffer, contentType: string }
 
@@ -127,6 +149,24 @@ function computeAlerts() {
 const inboundLog = []; // { type: "call"|"text", from, to, timestamp, body? }
 
 const pickFrom = () => FROM_NUMBERS[(rrIndex++) % FROM_NUMBERS.length];
+
+// Verify a call leg is genuinely still active by asking Telnyx directly.
+// Returns true only if Telnyx reports the call as active. Any error/unknown
+// => false, so we fail safe toward calling Sean's phone again.
+async function isLegAlive(ccid) {
+  if (!ccid) return false;
+  try {
+    const res = await fetch(TELNYX + `/calls/${ccid}`, {
+      headers: { Authorization: `Bearer ${TELNYX_API_KEY}` },
+    });
+    if (!res.ok) return false;
+    const j = await res.json();
+    // Telnyx returns call status; "active"/"bridged" mean the leg is live.
+    const status = (j?.data?.call_status || j?.data?.status || "").toLowerCase();
+    return status === "active" || status === "bridged" || j?.data?.is_alive === true;
+  } catch { return false; }
+}
+
 const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64");
 const unb64 = (s) => { try { return JSON.parse(Buffer.from(s, "base64").toString()); } catch { return {}; } };
 
@@ -151,6 +191,29 @@ async function telnyx(path, body, method = "POST") {
 
 const action = (ccid, name, payload = {}) =>
   telnyx(`/calls/${ccid}/actions/${name}`, payload);
+
+// Conference helpers using Telnyx's ACTUAL endpoints (verified against docs):
+//  - Create:  POST /conferences { name, call_control_id }  (first leg creates it)
+//  - Join:    POST /conferences/{id}/actions/join { call_control_id }
+// Sean's leg creates the conference; each lead joins it by id.
+async function createConferenceWithSean(seanCcid, name) {
+  const r = await telnyx("/conferences", {
+    name,
+    call_control_id: seanCcid,
+    beep_enabled: "never",
+    start_conference_on_create: true,
+  });
+  const id = r?.data?.id || null;
+  if (r?.errors) console.error("CONFERENCE CREATE FAILED:", JSON.stringify(r.errors));
+  return id;
+}
+async function joinConference(confId, leadCcid) {
+  return telnyx(`/conferences/${confId}/actions/join`, {
+    call_control_id: leadCcid,
+    beep_enabled: "never",
+    start_conference_on_enter: false,
+  });
+}
 
 // ============================================================================
 //  VOICEMAIL MANAGEMENT
@@ -178,6 +241,43 @@ app.get("/voicemail-status", (req, res) => {
 });
 
 // ============================================================================
+//  SESSION START — call Sean once, hold him in a persistent conference.
+//  Leads are bridged into this conference instantly, so connects have NO ring
+//  delay. Sean stays on one call for the whole session.
+// ============================================================================
+app.post("/session/start", async (req, res) => {
+  const { myPhone } = req.body || {};
+  if (!myPhone) return res.status(400).json({ error: "need myPhone" });
+  if (!FROM_NUMBERS.length) return res.status(500).json({ error: "no FROM_NUMBERS configured" });
+
+  // If Sean is already verified in the conference, do nothing.
+  if (session.seanUp && session.seanCallId && await isLegAlive(session.seanCallId)) {
+    return res.json({ ok: true, already: true, confName: session.confName });
+  }
+
+  session.confName = "sw_" + Date.now().toString(36);
+  session.confId = null;
+  session.pending = null;
+  console.log("Session start — calling Sean to hold in conference:", session.confName);
+  const call = await telnyx("/calls", {
+    connection_id: CONNECTION_ID,
+    to: myPhone,
+    from: pickFrom(),
+    webhook_url: `${PUBLIC_URL}/webhook`,
+    client_state: b64({ seanHold: true }),
+  });
+  session.seanCallId = call?.data?.call_control_id || null;
+  if (!session.seanCallId) {
+    const err = call?.errors?.[0] || {};
+    const reason = describeTelnyxError(err.code, err.detail, call?._httpStatus);
+    recordCallFailure(reason, err.code);
+    return res.status(502).json({ error: reason });
+  }
+  recordCallSuccess();
+  res.json({ ok: true, confName: session.confName });
+});
+
+// ============================================================================
 //  DIAL A BATCH
 // ============================================================================
 app.post("/dial-batch", async (req, res) => {
@@ -189,58 +289,43 @@ app.post("/dial-batch", async (req, res) => {
   const mkt = (market || DEFAULT_MARKET).toUpperCase();
   const batchId = "b_" + Date.now().toString(36);
 
-  // If Sean is already on the line from a previous batch, just fire leads directly.
-  if (session.seanUp && session.seanCallId) {
-    console.log("Sean already on line, firing leads directly");
-    await fireBatch(batchId, leads, mkt);
-    return res.json({ batchId });
+  // Sean must already be held in the conference (via /session/start). If he's
+  // not verified live, tell the frontend to start a session first. We NEVER
+  // dial leads without Sean already on the line — that's what caused leads to
+  // reach voicemail.
+  const seanLive = session.seanUp && session.seanCallId && await isLegAlive(session.seanCallId);
+  if (!seanLive) {
+    session.seanUp = false; session.seanCallId = null;
+    return res.status(409).json({ error: "no_session", message: "Start a session first — Sean must be on the line." });
   }
 
-  // If a call to Sean's phone is already in flight (seanCallId set but not yet
-  // answered), don't dial him again — queue these leads to fire when he answers.
-  if (session.seanCallId && !session.seanUp) {
-    console.log("Sean's phone already ringing — queueing leads for when he answers");
-    session.pending = { batchId, leads, market: mkt };
-    batches.set(batchId, { lines: new Map(), connected: false, done: false, market: mkt });
-    return res.json({ batchId });
-  }
-
-  // Otherwise, call Sean's phone first
-  session.pending = { batchId, leads, market: mkt };
-  console.log("Calling Sean's phone:", myPhone);
-  const call = await telnyx("/calls", {
-    connection_id: CONNECTION_ID,
-    to: myPhone,
-    from: pickFrom(),
-    webhook_url: `${PUBLIC_URL}/webhook`,
-  });
-  session.seanCallId = call?.data?.call_control_id || null;
-  if (!session.seanCallId) {
-    const err = call?.errors?.[0] || {};
-    const reason = describeTelnyxError(err.code, err.detail, call?._httpStatus);
-    recordCallFailure(reason, err.code);
-    console.log("Failed to call Sean's phone —", reason);
-  } else {
-    recordCallSuccess();
-  }
-
-  batches.set(batchId, { lines: new Map(), connected: false, done: false, market: mkt });
-  res.json({ batchId });
+  console.log("Sean held in conference — firing leads directly");
+  await fireBatch(batchId, leads, mkt);
+  return res.json({ batchId });
 });
+
 
 async function fireBatch(batchId, leads, market = DEFAULT_MARKET) {
   const lines = new Map();
   batches.set(batchId, { lines, connected: false, done: false, market });
 
   await Promise.all(leads.slice(0, 10).map(async (ld) => {
+    // BACKEND SAFETY: refuse to call a number that's hit its cap or was just
+    // called. This is the hard guarantee against calling anyone 20x in a row.
+    const gate = canCall(ld.to);
+    if (!gate.ok) {
+      console.log("BLOCKED re-dial of", ld.to, "—", gate.reason);
+      lines.set("blocked_" + ld.leadId, { leadId: ld.leadId, to: ld.to, status: "blocked", attempt: ld.attempt || 0, fromNumber: "-" });
+      return;
+    }
     const from = pickFrom();
     try {
+      recordCallAttempt(ld.to); // count the attempt BEFORE dialing, so a crash mid-dial still counts
       const call = await telnyx("/calls", {
         connection_id: CONNECTION_ID,
         to: ld.to,
         from,
         webhook_url: `${PUBLIC_URL}/webhook`,
-        answering_machine_detection: "premium",
         client_state: b64({ batchId, leadId: ld.leadId }),
       });
       const ccid = call?.data?.call_control_id;
@@ -342,10 +427,49 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
-  // ---- YOUR leg answered -> store your call ID, then fire any pending batch
-  if (type === "call.answered" && ccid === session.seanCallId) {
+  // ---- YOUR leg answered -> require a keypress to confirm a HUMAN picked up
+  //      (not your voicemail). Voicemail can't press 1, so this guarantees a
+  //      real person is on the line before any lead is ever connected.
+  if (type === "call.answered" && ccid === session.seanCallId && state.seanHold) {
+    console.log("Sean's phone answered — confirming human with keypress.");
+    // Telnyx requires the call to be answered before gather_using_speak. For an
+    // outbound call this is normally implicit when Sean picks up, but we issue
+    // answer defensively so the prompt can never silently fail.
+    await action(ccid, "answer", {}).catch(() => {});
+    await action(ccid, "gather_using_speak", {
+      payload: "Press any key to start your session.",
+      voice: "female",
+      language: "en-US",
+      min: 1,
+      max: 1,
+      tries: 3,                 // re-prompt up to 3x if no key yet
+      timeout: 10000,           // wait up to 10s for the first key
+      inter_digit_timeout: 5000,
+    });
+    return;
+  }
+
+  // ---- Sean pressed a key -> confirmed human -> create conference & hold him ----
+  if (type === "call.gather.ended" && ccid === session.seanCallId) {
+    const digits = p.digits || "";
+    if (!digits) {
+      // No key pressed within timeout => almost certainly voicemail. Hang up,
+      // do NOT mark Sean up, do NOT let any lead connect.
+      console.error("No keypress from Sean leg — treating as voicemail. Hanging up, session NOT started.");
+      await action(ccid, "hangup", {});
+      session.seanUp = false; session.seanCallId = null; session.pending = null; session.confId = null;
+      return;
+    }
+    console.log("Sean confirmed human (key:", digits, ") — creating conference:", session.confName);
+    session.confId = await createConferenceWithSean(ccid, session.confName);
+    if (!session.confId) {
+      console.error("Could not create conference — ending session to avoid bad state.");
+      await action(ccid, "hangup", {});
+      session.seanUp = false; session.seanCallId = null; session.pending = null;
+      return;
+    }
     session.seanUp = true;
-    console.log("Sean answered, call ID:", ccid);
+    console.log("Sean held in conference id:", session.confId);
     if (session.pending) {
       const { batchId, leads, market } = session.pending;
       session.pending = null;
@@ -354,32 +478,22 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
-  // ---- YOUR leg hung up -> end session ONLY if it was a real hangup by you,
-  //      not a bridged lead dropping. Verify your leg is actually gone before
-  //      tearing down, so one rude lead can't kill your whole session.
+  // ---- SEAN's leg hung up -> Sean ended the whole session.
+  //      (A lead hanging up does NOT touch Sean's leg in the conference model,
+  //      so this only fires when Sean himself hangs up his phone.)
   if (type === "call.hangup" && ccid === session.seanCallId) {
-    const cause = (p.hangup_cause || "").toLowerCase();
-    const source = (p.hangup_source || "").toLowerCase();
-    console.log("Sean-leg ended. cause:", cause, "source:", source, "— resetting session cleanly.");
-    // Your leg is physically gone no matter who caused it. Don't pretend it's
-    // alive (that caused the freeze + phantom transfers). Reset cleanly so the
-    // next Dial re-establishes you instantly. Mark active batch lines ended.
-    if (session.pending) {
-      const b = batches.get(session.pending.batchId);
-      if (b) b.done = true;
-    }
-    // close out any in-flight batch lines so the board doesn't hang on "ringing"
+    console.log("Sean hung up his phone — ending session.");
     for (const b of batches.values()) {
       if (!b.done) {
         for (const ln of b.lines.values()) {
           if (ln.status === "dialing" || ln.status === "ringing") ln.status = "ended";
         }
-        if (![...b.lines.values()].some(l => l.status === "dialing" || l.status === "ringing")) b.done = true;
+        b.done = true;
       }
     }
     session.confId = session.confName = session.seanCallId = null;
     session.seanUp = false; session.pending = null;
-    console.log("Session reset — ready to re-dial. (Lead hangups no longer freeze the board.)");
+    console.log("Session ended.");
     return;
   }
 
@@ -389,66 +503,71 @@ app.post("/webhook", async (req, res) => {
   const line = batch.lines.get(ccid);
 
   switch (type) {
-    case "call.answered":
-      if (line) { line.status = "ringing"; recordAnswered(line.fromNumber); }
-      break;
+    case "call.answered": {
+      // INSTANT CONNECT: the moment the lead picks up, join them to Sean's
+      // conference. No AMD wait, no detection pause — Sean is talking the second
+      // they say hello. (Tradeoff: if it's their voicemail, Sean hears it live
+      // and hangs up that lead himself; no silent voicemail is ever left.)
+      if (!line) break;
+      line.status = "ringing";
+      recordAnswered(line.fromNumber);
 
-    case "call.machine.premium.detection.ended":
-    case "call.machine.detection.ended": {
-      const result = (p.result || "").toLowerCase();
-      const isHuman = result.includes("human");
-      const isMachine = result.includes("machine");
-
-      if (isHuman && !batch.connected) {
-        batch.connected = true;
-        if (line) line.status = "connected";
-        console.log("Human detected! Bridging", ccid, "to Sean:", session.seanCallId);
-        // Guard: never fire a bridge with a blank target (the v3.2 422 bug)
-        if (!session.seanCallId) {
-          console.error("BRIDGE ABORTED — session.seanCallId is blank. Sean's leg is not up.");
-          batch.connected = false;
-          break;
-        }
-        // Direct bridge — connects Sean's call audio to this lead's call audio
-        const bridgeResult = await action(ccid, "bridge", {
-          call_control_id: session.seanCallId,
-        });
-        if (bridgeResult?.errors) {
-          console.error("BRIDGE FAILED:", JSON.stringify(bridgeResult.errors));
-        } else {
-          console.log("Bridge OK — Sean connected to lead", ccid);
-        }
+      if (batch.connected) {
+        // Sean is already talking to another lead — this extra pickup can't be
+        // connected. Hang it up so no one sits on a dead/silent line.
+        line.status = "dropped";
+        action(ccid, "hangup").catch(() => {});
+        break;
+      }
+      if (!session.seanCallId || !session.seanUp || !session.confId) {
+        console.error("LEAD DROPPED — Sean not held in conference. Not connecting.");
+        action(ccid, "hangup").catch(() => {});
+        break;
+      }
+      const seanAlive = await isLegAlive(session.seanCallId);
+      if (!seanAlive) {
+        console.error("LEAD DROPPED — Sean's conference leg not live. Not connecting.");
+        action(ccid, "hangup").catch(() => {});
+        session.seanUp = false; session.seanCallId = null;
+        break;
+      }
+      batch.connected = true;
+      line.status = "connected";
+      console.log("Lead answered — joining INSTANTLY to conference", session.confId, ":", ccid);
+      const joinResult = await joinConference(session.confId, ccid);
+      if (joinResult?.errors) {
+        console.error("CONFERENCE JOIN FAILED:", JSON.stringify(joinResult.errors));
+        line.status = "dropped";
+        batch.connected = false;
+        action(ccid, "hangup").catch(() => {});
+      } else {
+        console.log("Connected instantly — lead in Sean's conference", ccid);
+        // Hang up the other still-ringing leads — Sean can only talk to one.
         for (const [otherId, other] of batch.lines) {
           if (otherId !== ccid && (other.status === "dialing" || other.status === "ringing")) {
             other.status = "dropped";
             action(otherId, "hangup").catch(() => {});
           }
         }
-      } else if (isHuman && batch.connected) {
-        if (line) line.status = "dropped";
-        action(ccid, "hangup").catch(() => {});
-      } else if (isMachine) {
-        if (line) line.status = "machine";
-        // Only leave a voicemail on the FIRST attempt — never spam the same person
-        if (voicemailAudio && PUBLIC_URL && line && (line.attempt || 0) === 0) {
-          await action(ccid, "playback_start", {
-            audio_url: `${PUBLIC_URL}/voicemail.mp3`,
-          });
-          setTimeout(() => action(ccid, "hangup").catch(() => {}), 15000);
-        } else {
-          // Second/third attempt or no voicemail — hang up silently
-          action(ccid, "hangup").catch(() => {});
-        }
       }
       break;
     }
 
+    case "call.machine.premium.detection.ended":
+    case "call.machine.detection.ended":
+      // No longer used for connect decisions (we connect on answer for zero
+      // delay). Kept as a NO-OP in case AMD is still enabled on the number.
+      break;
+
     case "call.hangup":
-      // A LEAD line ended. This must NEVER affect Sean's session.
-      if (line && line.status !== "connected") line.status = line.status || "dropped";
+      // A LEAD line ended. This NEVER affects Sean — he stays in the conference.
       if (line && line.status === "connected") {
         line.status = "ended";
-        console.log("Lead hung up after talking — session stays live for next batch.");
+        // Free the conference so the NEXT lead can be connected to Sean.
+        batch.connected = false;
+        console.log("Lead left the conference — Sean stays on, ready for next lead.");
+      } else if (line) {
+        line.status = line.status || "dropped";
       }
       if (![...batch.lines.values()].some(l => l.status === "dialing" || l.status === "ringing"))
         batch.done = true;
@@ -560,16 +679,31 @@ app.get("/inbound-log", (req, res) => {
 });
 
 app.post("/hangup-all", async (req, res) => {
-  for (const batch of batches.values())
-    for (const [ccid, l] of batch.lines)
-      if (l.status !== "connected") action(ccid, "hangup").catch(() => {});
+  // Emergency stop: hang up EVERY lead leg, including connected ones, so nothing
+  // can linger (e.g. a misclassified voicemail sitting in the conference).
+  for (const batch of batches.values()) {
+    for (const [ccid, l] of batch.lines) {
+      if (!String(ccid).startsWith("blocked_")) action(ccid, "hangup").catch(() => {});
+      l.status = "ended";
+    }
+    batch.done = true;
+    batch.connected = false;
+  }
   res.json({ ok: true });
 });
 
 app.post("/session/end", async (req, res) => {
+  // Drop ALL lead legs first, then Sean's leg, then clear all state.
+  for (const batch of batches.values()) {
+    for (const [ccid] of batch.lines) {
+      if (!String(ccid).startsWith("blocked_")) action(ccid, "hangup").catch(() => {});
+    }
+    batch.done = true; batch.connected = false;
+  }
   if (session.seanCallId) action(session.seanCallId, "hangup").catch(() => {});
   session.confId = session.confName = session.seanCallId = null;
   session.seanUp = false; session.pending = null;
+  console.log("Session ended by user — all legs dropped.");
   res.json({ ok: true });
 });
 
@@ -634,4 +768,4 @@ app.get("/health", async (_req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.5.0 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.7.1 backend listening on :${PORT}`));

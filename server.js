@@ -202,16 +202,23 @@ async function createConferenceWithSean(seanCcid, name) {
     call_control_id: seanCcid,
     beep_enabled: "never",
     start_conference_on_create: true,
+    comfort_noise: true,
   });
   const id = r?.data?.id || null;
   if (r?.errors) console.error("CONFERENCE CREATE FAILED:", JSON.stringify(r.errors));
   return id;
 }
 async function joinConference(confId, leadCcid) {
+  // start_conference_on_enter: true => the conference audio is LIVE the moment
+  // the lead enters, so Sean and the lead hear each other immediately. The old
+  // value (false) parked the lead in a held/waiting state with no audio — the
+  // "silent room" bug where calls connected but no one could hear anyone.
   return telnyx(`/conferences/${confId}/actions/join`, {
     call_control_id: leadCcid,
     beep_enabled: "never",
-    start_conference_on_enter: false,
+    start_conference_on_enter: true,
+    end_conference_on_exit: false,
+    supervisor_role: "none",
   });
 }
 
@@ -255,9 +262,17 @@ app.post("/session/start", async (req, res) => {
     return res.json({ ok: true, already: true, confName: session.confName });
   }
 
+  // DEBOUNCE: if we just called Sean's phone in the last 30s and it's still
+  // pending (ringing / awaiting keypress), don't ring him again. This stops the
+  // thrash where the frontend fired /session/start 7 times in a row.
+  if (session.seanCallId && session.startedAt && (Date.now() - session.startedAt) < 30000) {
+    return res.json({ ok: true, pending: true, message: "Already calling your phone — answer it." });
+  }
+
   session.confName = "sw_" + Date.now().toString(36);
   session.confId = null;
   session.pending = null;
+  session.startedAt = Date.now();
   console.log("Session start — calling Sean to hold in conference:", session.confName);
   const call = await telnyx("/calls", {
     connection_id: CONNECTION_ID,
@@ -490,7 +505,7 @@ app.post("/webhook", async (req, res) => {
       }
     }
     session.confId = session.confName = session.seanCallId = null;
-    session.seanUp = false; session.pending = null;
+    session.seanUp = false; session.pending = null; session.startedAt = null;
     console.log("Session ended.");
     return;
   }
@@ -786,4 +801,4 @@ app.get("/health", async (_req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.7.2 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.7.3 backend listening on :${PORT}`));

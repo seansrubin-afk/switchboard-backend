@@ -68,10 +68,29 @@ function canCall(toNumber) {
     return { ok: false, reason: `called ${Math.round(since)}s ago (min ${MIN_SECONDS_BETWEEN_CALLS}s)` };
   return { ok: true };
 }
-function recordCallAttempt(toNumber) {
-  const h = callHistory[toNumber] || { attempts: 0, lastCalledAt: 0 };
+function recordCallAttempt(toNumber, name) {
+  const h = callHistory[toNumber] || { attempts: 0, lastCalledAt: 0, name: "", history: [] };
   h.attempts += 1; h.lastCalledAt = Date.now();
+  if (name) h.name = name;
+  if (!h.history) h.history = [];
+  h.history.push({ at: new Date().toISOString(), outcome: "dialed" });
   callHistory[toNumber] = h;
+}
+function recordOutcome(toNumber, outcome) {
+  const h = callHistory[toNumber];
+  if (!h) return;
+  h.lastOutcome = outcome;
+  if (h.history && h.history.length) h.history[h.history.length - 1].outcome = outcome;
+}
+
+// ---- SERVER-SIDE DISPOSITIONS (survive device switches / re-imports) ----
+// Once a lead is dispositioned (no/booked/interested/callback), we remember it
+// here so it can never be re-dialed, even from a different browser.
+const dispositions = {}; // { "+phone": { status, at } }
+function isDispositioned(phone) {
+  const d = dispositions[phone];
+  // "callback" leads are still callable later; everything else is done.
+  return d && d.status && d.status !== "callback";
 }
 
 // Voicemail audio (uploaded by user, stored in memory)
@@ -333,9 +352,16 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET) {
       lines.set("blocked_" + ld.leadId, { leadId: ld.leadId, to: ld.to, status: "blocked", attempt: ld.attempt || 0, fromNumber: "-" });
       return;
     }
+    // Never re-dial a lead that's already been dispositioned (server-side memory,
+    // survives device switches and CSV re-imports).
+    if (isDispositioned(ld.to)) {
+      console.log("SKIPPED already-dispositioned lead", ld.to, "—", dispositions[ld.to].status);
+      lines.set("dispo_" + ld.leadId, { leadId: ld.leadId, to: ld.to, status: "done", attempt: ld.attempt || 0, fromNumber: "-" });
+      return;
+    }
     const from = pickFrom();
     try {
-      recordCallAttempt(ld.to); // count the attempt BEFORE dialing, so a crash mid-dial still counts
+      recordCallAttempt(ld.to, ld.name); // count the attempt BEFORE dialing, so a crash mid-dial still counts
       const call = await telnyx("/calls", {
         connection_id: CONNECTION_ID,
         to: ld.to,
@@ -522,6 +548,7 @@ app.post("/webhook", async (req, res) => {
       }
       batch.connected = true;
       line.status = "connected";
+      recordOutcome(line.to, "connected");
       console.log("Lead answered — joining INSTANTLY to conference", session.confId, ":", ccid);
       const joinResult = await joinConference(session.confId, ccid);
       if (joinResult?.errors) {
@@ -734,6 +761,30 @@ app.post("/drop-lead", async (req, res) => {
   res.json({ ok: true, dropped });
 });
 
+// ---- RECORD A DISPOSITION (so the lead is never re-dialed, any device) ----
+app.post("/disposition", (req, res) => {
+  const { phone, status } = req.body || {};
+  if (!phone || !status) return res.status(400).json({ error: "need phone and status" });
+  dispositions[phone] = { status, at: new Date().toISOString() };
+  console.log("Disposition recorded:", phone, "->", status);
+  res.json({ ok: true });
+});
+app.get("/dispositions", (_req, res) => {
+  res.json({ dispositions });
+});
+
+// ---- CALL LOG (who was called, how many times, last outcome) ----
+app.get("/call-log", (_req, res) => {
+  const log = Object.entries(callHistory).map(([phone, h]) => ({
+    phone,
+    name: h.name || "",
+    attempts: h.attempts || 0,
+    lastCalledAt: h.lastCalledAt ? new Date(h.lastCalledAt).toISOString() : null,
+    lastOutcome: h.lastOutcome || "dialed",
+  })).sort((a, b) => (b.lastCalledAt || "").localeCompare(a.lastCalledAt || ""));
+  res.json({ totalNumbers: log.length, totalCalls: log.reduce((s, x) => s + x.attempts, 0), log });
+});
+
 // ---- NUMBER MANAGEMENT (live, syncs the dialer's rotation) ----
 app.get("/numbers", (_req, res) => {
   res.json({ numbers: FROM_NUMBERS, reputation: numberReputation() });
@@ -777,4 +828,4 @@ app.get("/health", async (_req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.7.4 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.8.0 backend listening on :${PORT}`));

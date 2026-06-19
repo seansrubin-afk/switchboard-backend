@@ -442,43 +442,18 @@ app.post("/webhook", async (req, res) => {
     return;
   }
 
-  // ---- YOUR leg answered -> require a keypress to confirm a HUMAN picked up
-  //      (not your voicemail). Voicemail can't press 1, so this guarantees a
-  //      real person is on the line before any lead is ever connected.
+  // ---- YOUR leg answered -> put you straight into the conference, held.
+  //      (No keypress step — it required an 'answer' command that Telnyx rejects
+  //      on outbound calls, which broke confirmation entirely. Instead we go
+  //      straight to conference. The voicemail guard is: leads only connect when
+  //      isLegAlive confirms your leg is genuinely live at connect time.)
   if (type === "call.answered" && ccid === session.seanCallId && state.seanHold) {
-    console.log("Sean's phone answered — confirming human with keypress.");
-    // No 'answer' command here — Telnyx rejects answering an OUTBOUND call (the
-    // call is already answered when Sean picks up). Go straight to the prompt.
-    await action(ccid, "gather_using_speak", {
-      payload: "Press any key to start your session.",
-      voice: "female",
-      language: "en-US",
-      min: 1,
-      max: 1,
-      tries: 3,                 // re-prompt up to 3x if no key yet
-      timeout: 10000,           // wait up to 10s for the first key
-      inter_digit_timeout: 5000,
-    });
-    return;
-  }
-
-  // ---- Sean pressed a key -> confirmed human -> create conference & hold him ----
-  if (type === "call.gather.ended" && ccid === session.seanCallId) {
-    const digits = p.digits || "";
-    if (!digits) {
-      // No key pressed within timeout => almost certainly voicemail. Hang up,
-      // do NOT mark Sean up, do NOT let any lead connect.
-      console.error("No keypress from Sean leg — treating as voicemail. Hanging up, session NOT started.");
-      await action(ccid, "hangup", {});
-      session.seanUp = false; session.seanCallId = null; session.pending = null; session.confId = null;
-      return;
-    }
-    console.log("Sean confirmed human (key:", digits, ") — creating conference:", session.confName);
+    console.log("Sean's phone answered — creating conference and holding him.");
     session.confId = await createConferenceWithSean(ccid, session.confName);
     if (!session.confId) {
-      console.error("Could not create conference — ending session to avoid bad state.");
-      await action(ccid, "hangup", {});
-      session.seanUp = false; session.seanCallId = null; session.pending = null;
+      console.error("Could not create conference — ending session.");
+      await action(ccid, "hangup", {}).catch(() => {});
+      session.seanUp = false; session.seanCallId = null; session.pending = null; session.startedAt = null;
       return;
     }
     session.seanUp = true;
@@ -490,6 +465,7 @@ app.post("/webhook", async (req, res) => {
     }
     return;
   }
+
 
   // ---- SEAN's leg hung up -> Sean ended the whole session.
   //      (A lead hanging up does NOT touch Sean's leg in the conference model,
@@ -801,4 +777,4 @@ app.get("/health", async (_req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.7.3 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.7.4 backend listening on :${PORT}`));

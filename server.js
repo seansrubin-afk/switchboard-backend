@@ -48,7 +48,7 @@ function numberReputation() {
 }
 
 // ---- in-memory state ----
-const session = { confId: null, confName: null, seanCallId: null, seanUp: false, pending: null };
+const session = { confId: null, confName: null, seanCallId: null, seanUp: false, pending: null, leadOnLine: false, connectedLeadCcid: null };
 const batches = new Map();
 let rrIndex = 0;
 
@@ -315,13 +315,16 @@ app.post("/session/start", async (req, res) => {
 //  DIAL A BATCH
 // ============================================================================
 app.post("/dial-batch", async (req, res) => {
-  const { myPhone, leads, market } = req.body || {};
+  const { myPhone, leads, market, dialCount } = req.body || {};
   if (!myPhone || !Array.isArray(leads) || leads.length === 0)
     return res.status(400).json({ error: "need myPhone and leads[]" });
   if (!FROM_NUMBERS.length) return res.status(500).json({ error: "no FROM_NUMBERS configured" });
 
   const mkt = (market || DEFAULT_MARKET).toUpperCase();
   const batchId = "b_" + Date.now().toString(36);
+  // How many leads to actually dial this batch (1-10). Backend hard-caps at 10
+  // regardless of what the frontend sends, as a safety ceiling.
+  const count = Math.max(1, Math.min(10, parseInt(dialCount, 10) || leads.length));
 
   // Sean must already be held in the conference (via /session/start). If he's
   // not verified live, tell the frontend to start a session first. We NEVER
@@ -333,17 +336,24 @@ app.post("/dial-batch", async (req, res) => {
     return res.status(409).json({ error: "no_session", message: "Start a session first — Sean must be on the line." });
   }
 
-  console.log("Sean held in conference — firing leads directly");
-  await fireBatch(batchId, leads, mkt);
+  // Don't fire a new batch while Sean is already connected to a lead. Firing
+  // overlapping batches is what put multiple people + voicemails in the
+  // conference at once. Tell the frontend to wait.
+  if (session.leadOnLine) {
+    return res.status(409).json({ error: "busy", message: "You're on a call — finish it before dialing the next batch." });
+  }
+
+  console.log("Sean held in conference — firing", count, "leads");
+  await fireBatch(batchId, leads, mkt, count);
   return res.json({ batchId });
 });
 
 
-async function fireBatch(batchId, leads, market = DEFAULT_MARKET) {
+async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
   const lines = new Map();
   batches.set(batchId, { lines, connected: false, done: false, market });
 
-  await Promise.all(leads.slice(0, 10).map(async (ld) => {
+  await Promise.all(leads.slice(0, Math.max(1, Math.min(10, count))).map(async (ld) => {
     // BACKEND SAFETY: refuse to call a number that's hit its cap or was just
     // called. This is the hard guarantee against calling anyone 20x in a row.
     const gate = canCall(ld.to);
@@ -507,7 +517,7 @@ app.post("/webhook", async (req, res) => {
       }
     }
     session.confId = session.confName = session.seanCallId = null;
-    session.seanUp = false; session.pending = null; session.startedAt = null;
+    session.seanUp = false; session.pending = null; session.startedAt = null; session.leadOnLine = false; session.connectedLeadCcid = null;
     console.log("Session ended.");
     return;
   }
@@ -527,9 +537,12 @@ app.post("/webhook", async (req, res) => {
       line.status = "ringing";
       recordAnswered(line.fromNumber);
 
-      if (batch.connected) {
-        // Sean is already talking to another lead — this extra pickup can't be
-        // connected. Hang it up so no one sits on a dead/silent line.
+      // GLOBAL one-at-a-time guard: if ANY lead (from any batch) is already
+      // connected to Sean, this pickup must NOT also be connected. The old guard
+      // (batch.connected) was per-batch, so two overlapping batches could each
+      // connect a lead — putting multiple people + voicemails in the conference
+      // at once. session.leadOnLine is global and fixes that.
+      if (session.leadOnLine || batch.connected) {
         line.status = "dropped";
         action(ccid, "hangup").catch(() => {});
         break;
@@ -546,6 +559,10 @@ app.post("/webhook", async (req, res) => {
         session.seanUp = false; session.seanCallId = null;
         break;
       }
+      // Claim the line GLOBALLY before joining, so no other concurrent webhook
+      // can also connect a lead in the gap before the join completes.
+      session.leadOnLine = true;
+      session.connectedLeadCcid = ccid;
       batch.connected = true;
       line.status = "connected";
       recordOutcome(line.to, "connected");
@@ -555,6 +572,8 @@ app.post("/webhook", async (req, res) => {
         console.error("CONFERENCE JOIN FAILED:", JSON.stringify(joinResult.errors));
         line.status = "dropped";
         batch.connected = false;
+        session.leadOnLine = false;
+        session.connectedLeadCcid = null;
         action(ccid, "hangup").catch(() => {});
       } else {
         console.log("Connected instantly — lead in Sean's conference", ccid);
@@ -579,11 +598,19 @@ app.post("/webhook", async (req, res) => {
       // A LEAD line ended. This NEVER affects Sean — he stays in the conference.
       if (line && line.status === "connected") {
         line.status = "ended";
-        // Free the conference so the NEXT lead can be connected to Sean.
         batch.connected = false;
+        // Release the GLOBAL guard so the next lead (any batch) can connect.
+        session.leadOnLine = false;
+        session.connectedLeadCcid = null;
         console.log("Lead left the conference — Sean stays on, ready for next lead.");
       } else if (line) {
         line.status = line.status || "dropped";
+      }
+      // Safety: if the leg that ended was the one we recorded as connected,
+      // clear the global flag even if status bookkeeping missed it.
+      if (session.connectedLeadCcid === ccid) {
+        session.leadOnLine = false;
+        session.connectedLeadCcid = null;
       }
       if (![...batch.lines.values()].some(l => l.status === "dialing" || l.status === "ringing"))
         batch.done = true;
@@ -718,7 +745,7 @@ app.post("/session/end", async (req, res) => {
   }
   if (session.seanCallId) action(session.seanCallId, "hangup").catch(() => {});
   session.confId = session.confName = session.seanCallId = null;
-  session.seanUp = false; session.pending = null;
+  session.seanUp = false; session.pending = null; session.leadOnLine = false; session.connectedLeadCcid = null;
   console.log("Session ended by user — all legs dropped.");
   res.json({ ok: true });
 });
@@ -757,6 +784,9 @@ app.post("/drop-lead", async (req, res) => {
     // free the slot so the next lead can connect / next batch can fire
     batch.connected = false;
   }
+  // Release the GLOBAL guard so the next lead can connect after a manual drop.
+  session.leadOnLine = false;
+  session.connectedLeadCcid = null;
   console.log("Dropped current lead(s):", dropped, "— Sean stays on the line.");
   res.json({ ok: true, dropped });
 });
@@ -828,4 +858,4 @@ app.get("/health", async (_req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.8.0 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.8.2 backend listening on :${PORT}`));

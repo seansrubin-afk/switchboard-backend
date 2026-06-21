@@ -21,10 +21,30 @@ app.use((req, res, next) => {
 
 const TELNYX_API_KEY   = process.env.TELNYX_API_KEY;
 const CONNECTION_ID    = process.env.TELNYX_CONNECTION_ID;
-let   FROM_NUMBERS      = (process.env.FROM_NUMBERS || "").split(",").map(s => s.trim()).filter(Boolean);
+// All three Telnyx caller-ID numbers are baked in as the permanent default, so the
+// dialer always has them even if the Railway FROM_NUMBERS variable is ever empty or
+// wiped on a redeploy. Setting FROM_NUMBERS in Railway still overrides this list.
+const DEFAULT_FROM_NUMBERS = "+13159232442,+17852024556,+16363302146";
+let   FROM_NUMBERS      = (process.env.FROM_NUMBERS || DEFAULT_FROM_NUMBERS).split(",").map(s => s.trim()).filter(Boolean);
 const PUBLIC_URL       = process.env.PUBLIC_URL;
 const DEFAULT_MARKET   = (process.env.DEFAULT_MARKET || "US").toUpperCase();
 const MY_PHONE         = process.env.MY_PHONE || "";
+// If set (e.g. "sip:myusername@sip.telnyx.com"), the Switchboard rings this SIP
+// softphone over the internet instead of the PSTN number. Fixes laggy WiFi-Calling
+// delivery when abroad. Leave blank to use the phone number as before.
+const SIP_DESTINATION  = process.env.SIP_DESTINATION || "";
+const ringMe = (phoneFallback) => SIP_DESTINATION || phoneFallback || MY_PHONE;
+
+// Automatic voicemail drop. When on (the default), each lead call runs answering-
+// machine detection: real humans get connected to you, machines get your pre-recorded
+// voicemail dropped automatically. This adds roughly 1-2s of detection per call. Set
+// VM_AUTO=off in Railway to turn it off and revert to instant, zero-delay connect with
+// no voicemail drop (your exact previous behavior).
+const VM_AUTO = String(process.env.VM_AUTO ?? "on").toLowerCase() !== "off";
+// Detection engine: "premium" (most accurate at telling humans from machines, small
+// per-call cost) or "detect" (standard, free, a bit less accurate). Only used when
+// VM_AUTO is on. Change with the AMD_MODE Railway variable.
+const AMD_MODE = (process.env.AMD_MODE || "premium").toLowerCase();
 
 const TELNYX = "https://api.telnyx.com/v2";
 
@@ -295,7 +315,7 @@ app.post("/session/start", async (req, res) => {
   console.log("Session start — calling Sean to hold in conference:", session.confName);
   const call = await telnyx("/calls", {
     connection_id: CONNECTION_ID,
-    to: myPhone,
+    to: ringMe(myPhone),
     from: pickFrom(),
     webhook_url: `${PUBLIC_URL}/webhook`,
     client_state: b64({ seanHold: true }),
@@ -378,6 +398,9 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
         from,
         webhook_url: `${PUBLIC_URL}/webhook`,
         client_state: b64({ batchId, leadId: ld.leadId }),
+        // Answering-machine detection so machines get the voicemail drop and humans
+        // get connected. Engine set by AMD_MODE. Only added when VM_AUTO is on.
+        ...(VM_AUTO ? { answering_machine_detection: AMD_MODE } : {}),
       });
       const ccid = call?.data?.call_control_id;
       if (ccid) {
@@ -415,6 +438,90 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
 }
 
 // ============================================================================
+//  CONNECT vs VOICEMAIL HELPERS
+// ============================================================================
+// Bridge a lead leg into Sean's conference. This is the original instant-connect
+// path, lifted out unchanged so it can be reused whether we connect on answer
+// (VM_AUTO off) or after the lead is confirmed human (VM_AUTO on). Every original
+// guard still runs here, at connect time.
+async function bridgeLeadToSean(ccid, batch, line) {
+  if (!line) return;
+  if (line.amdTimer) { clearTimeout(line.amdTimer); line.amdTimer = null; }
+  line.awaitingAMD = false;
+  // GLOBAL one-at-a-time guard.
+  if (session.leadOnLine || batch.connected) {
+    line.status = "dropped";
+    action(ccid, "hangup").catch(() => {});
+    return;
+  }
+  if (!session.seanCallId || !session.seanUp || !session.confId) {
+    console.error("LEAD DROPPED — Sean not held in conference. Not connecting.");
+    action(ccid, "hangup").catch(() => {});
+    return;
+  }
+  const seanAlive = await isLegAlive(session.seanCallId);
+  if (!seanAlive) {
+    console.error("LEAD DROPPED — Sean's conference leg not live. Not connecting.");
+    action(ccid, "hangup").catch(() => {});
+    session.seanUp = false; session.seanCallId = null;
+    return;
+  }
+  session.leadOnLine = true;
+  session.connectedLeadCcid = ccid;
+  batch.connected = true;
+  line.status = "connected";
+  recordOutcome(line.to, "connected");
+  console.log("Lead is a human — joining to conference", session.confId, ":", ccid);
+  const joinResult = await joinConference(session.confId, ccid);
+  if (joinResult?.errors) {
+    console.error("CONFERENCE JOIN FAILED:", JSON.stringify(joinResult.errors));
+    line.status = "dropped";
+    batch.connected = false;
+    session.leadOnLine = false;
+    session.connectedLeadCcid = null;
+    action(ccid, "hangup").catch(() => {});
+  } else {
+    console.log("Connected — lead in Sean's conference", ccid);
+    // Hang up the other still-ringing leads — Sean can only talk to one. Leads that
+    // are mid-voicemail (status "voicemail") are left alone to finish.
+    for (const [otherId, other] of batch.lines) {
+      if (otherId !== ccid && (other.status === "dialing" || other.status === "ringing")) {
+        other.status = "dropped";
+        action(otherId, "hangup").catch(() => {});
+      }
+    }
+  }
+}
+
+// Drop the pre-recorded voicemail onto a lead leg that detection flagged as a
+// machine, then hang up. The lead was never bridged into the conference, so the
+// recording plays straight to their voicemail box and Sean never hears it. Other
+// still-ringing leads keep ringing in case one is a human.
+async function dropVoicemail(ccid, batch, line) {
+  if (!line) return;
+  if (line.amdTimer) { clearTimeout(line.amdTimer); line.amdTimer = null; }
+  line.awaitingAMD = false;
+  line.status = "voicemail";
+  recordOutcome(line.to, "voicemail");
+  if (!voicemailAudio || !PUBLIC_URL) {
+    console.log("Machine detected, no recording available — hanging up", ccid);
+    action(ccid, "hangup").catch(() => {});
+    return;
+  }
+  line.vmPlaying = true;
+  // One voicemail per person: mark this lead dispositioned so it's never re-dialed
+  // (and so a second voicemail is never left) for the rest of this server run.
+  dispositions[line.to] = { status: "voicemail", at: new Date().toISOString() };
+  console.log("Machine detected — dropping your voicemail on", ccid, "(won't redial)");
+  const r = await action(ccid, "playback_start", { audio_url: `${PUBLIC_URL}/voicemail.mp3` });
+  if (r?.errors) {
+    console.error("VOICEMAIL PLAYBACK FAILED:", JSON.stringify(r.errors));
+    line.vmPlaying = false;
+    action(ccid, "hangup").catch(() => {});
+  }
+}
+
+// ============================================================================
 //  TELNYX WEBHOOK
 // ============================================================================
 app.post("/webhook", async (req, res) => {
@@ -437,7 +544,7 @@ app.post("/webhook", async (req, res) => {
     // Forward to your phone if configured
     if (MY_PHONE && ccid) {
       await action(ccid, "answer");
-      await action(ccid, "transfer", { to: MY_PHONE });
+      await action(ccid, "transfer", { to: ringMe(MY_PHONE) });
     }
     return;
   }
@@ -529,73 +636,88 @@ app.post("/webhook", async (req, res) => {
 
   switch (type) {
     case "call.answered": {
-      // INSTANT CONNECT: the moment the lead picks up, join them to Sean's
-      // conference. No AMD wait, no detection pause — Sean is talking the second
-      // they say hello. (Tradeoff: if it's their voicemail, Sean hears it live
-      // and hangs up that lead himself; no silent voicemail is ever left.)
       if (!line) break;
       line.status = "ringing";
       recordAnswered(line.fromNumber);
 
-      // GLOBAL one-at-a-time guard: if ANY lead (from any batch) is already
-      // connected to Sean, this pickup must NOT also be connected. The old guard
-      // (batch.connected) was per-batch, so two overlapping batches could each
-      // connect a lead — putting multiple people + voicemails in the conference
-      // at once. session.leadOnLine is global and fixes that.
-      if (session.leadOnLine || batch.connected) {
-        line.status = "dropped";
-        action(ccid, "hangup").catch(() => {});
+      if (!VM_AUTO) {
+        // Zero-delay path (VM_AUTO off): connect the instant they answer. Identical
+        // to the original instant-connect behavior.
+        await bridgeLeadToSean(ccid, batch, line);
         break;
       }
-      if (!session.seanCallId || !session.seanUp || !session.confId) {
-        console.error("LEAD DROPPED — Sean not held in conference. Not connecting.");
-        action(ccid, "hangup").catch(() => {});
-        break;
-      }
-      const seanAlive = await isLegAlive(session.seanCallId);
-      if (!seanAlive) {
-        console.error("LEAD DROPPED — Sean's conference leg not live. Not connecting.");
-        action(ccid, "hangup").catch(() => {});
-        session.seanUp = false; session.seanCallId = null;
-        break;
-      }
-      // Claim the line GLOBALLY before joining, so no other concurrent webhook
-      // can also connect a lead in the gap before the join completes.
-      session.leadOnLine = true;
-      session.connectedLeadCcid = ccid;
-      batch.connected = true;
-      line.status = "connected";
-      recordOutcome(line.to, "connected");
-      console.log("Lead answered — joining INSTANTLY to conference", session.confId, ":", ccid);
-      const joinResult = await joinConference(session.confId, ccid);
-      if (joinResult?.errors) {
-        console.error("CONFERENCE JOIN FAILED:", JSON.stringify(joinResult.errors));
-        line.status = "dropped";
-        batch.connected = false;
-        session.leadOnLine = false;
-        session.connectedLeadCcid = null;
-        action(ccid, "hangup").catch(() => {});
-      } else {
-        console.log("Connected instantly — lead in Sean's conference", ccid);
-        // Hang up the other still-ringing leads — Sean can only talk to one.
-        for (const [otherId, other] of batch.lines) {
-          if (otherId !== ccid && (other.status === "dialing" || other.status === "ringing")) {
-            other.status = "dropped";
-            action(otherId, "hangup").catch(() => {});
-          }
+
+      // VM_AUTO on: wait for answering-machine detection before deciding. Humans get
+      // bridged, machines get the voicemail drop. Safety net: if detection has not
+      // resolved within 4s, treat it as a human and connect, so a real person is
+      // never left sitting in silence.
+      line.awaitingAMD = true;
+      line.amdTimer = setTimeout(() => {
+        if (line.awaitingAMD) {
+          console.log("Detection timed out — treating as human and connecting", ccid);
+          bridgeLeadToSean(ccid, batch, line).catch(() => {});
         }
-      }
+      }, 4000);
       break;
     }
 
     case "call.machine.premium.detection.ended":
-    case "call.machine.detection.ended":
-      // No longer used for connect decisions (we connect on answer for zero
-      // delay). Kept as a NO-OP in case AMD is still enabled on the number.
+    case "call.machine.detection.ended": {
+      if (!VM_AUTO || !line || !line.awaitingAMD) break;
+      const result = String(p.result || "").toLowerCase();
+      // Machine-like results -> it's a voicemail. Everything else (human, not_sure,
+      // silence, undetermined) -> connect, so a recording is never played at a real
+      // person.
+      const isMachine = result.includes("machine") || result === "fax";
+      line.awaitingAMD = false;
+      if (line.amdTimer) { clearTimeout(line.amdTimer); line.amdTimer = null; }
+      if (isMachine) {
+        // Don't play yet. Wait for the beep (call.machine.greeting.ended) so the
+        // whole message lands instead of playing over the greeting. Fallback: if no
+        // beep event arrives within 22s, drop it anyway.
+        line.machineDetected = true;
+        line.vmBeepTimer = setTimeout(() => {
+          if (line.machineDetected && !line.vmPlaying) dropVoicemail(ccid, batch, line).catch(() => {});
+        }, 22000);
+      } else {
+        await bridgeLeadToSean(ccid, batch, line);
+      }
       break;
+    }
+
+    case "call.machine.premium.greeting.ended":
+    case "call.machine.greeting.ended": {
+      if (!VM_AUTO || !line) break;
+      const gresult = String(p.result || "").toLowerCase();
+      // A beep means we reached the voicemail box — play the recording NOW, after the
+      // beep, so the full message is left. Covers the case where the beep is detected
+      // before the human/machine classification too.
+      if ((gresult === "beep_detected" || line.machineDetected) && !line.vmPlaying) {
+        line.awaitingAMD = false;
+        if (line.amdTimer) { clearTimeout(line.amdTimer); line.amdTimer = null; }
+        if (line.vmBeepTimer) { clearTimeout(line.vmBeepTimer); line.vmBeepTimer = null; }
+        await dropVoicemail(ccid, batch, line);
+      }
+      break;
+    }
+
+    case "call.playback.ended":
+    case "call.playback.stopped": {
+      // The voicemail recording finished playing on a machine line — hang it up.
+      if (line && line.vmPlaying) {
+        line.vmPlaying = false;
+        line.status = "voicemail";
+        console.log("Voicemail finished — hanging up", ccid);
+        action(ccid, "hangup").catch(() => {});
+      }
+      break;
+    }
 
     case "call.hangup":
       // A LEAD line ended. This NEVER affects Sean — he stays in the conference.
+      if (line && line.amdTimer) { clearTimeout(line.amdTimer); line.amdTimer = null; }
+      if (line && line.vmBeepTimer) { clearTimeout(line.vmBeepTimer); line.vmBeepTimer = null; }
+      if (line) { line.awaitingAMD = false; line.machineDetected = false; }
       if (line && line.status === "connected") {
         line.status = "ended";
         batch.connected = false;
@@ -655,7 +777,7 @@ app.post("/direct-call", async (req, res) => {
   try {
     console.log("Direct call: calling your phone", myPhone, "then will dial", to);
     const call1 = await telnyx("/calls", {
-      connection_id: CONNECTION_ID, to: myPhone, from,
+      connection_id: CONNECTION_ID, to: ringMe(myPhone), from,
       webhook_url: `${PUBLIC_URL}/webhook`,
     });
     const ccid = call1?.data?.call_control_id;
@@ -676,7 +798,7 @@ app.post("/call-back", async (req, res) => {
   try {
     // Call your phone first
     const call1 = await telnyx("/calls", {
-      connection_id: CONNECTION_ID, to: myPhone, from,
+      connection_id: CONNECTION_ID, to: ringMe(myPhone), from,
       webhook_url: `${PUBLIC_URL}/webhook`,
       client_state: b64({ callback: true, callbackTo: to, callbackFrom: from }),
     });

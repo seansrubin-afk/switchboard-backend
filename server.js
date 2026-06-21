@@ -78,6 +78,18 @@ let rrIndex = 0;
 const MAX_ATTEMPTS_PER_NUMBER = 3;        // absolute max calls to one number, ever, per server run
 const MIN_SECONDS_BETWEEN_CALLS = 90;     // a number cannot be re-dialed within this window
 const callHistory = {};                   // { "+1leadphone": { attempts, lastCalledAt } }
+// Normalize any phone number to clean +E164 before dialing. Lead lists are messy:
+// numbers come in as "+(647)513-8747", "(647) 513-8747", or "647-513-8747", and
+// Telnyx rejects anything that isn't strictly "+" followed by digits (error 10016).
+// We strip all formatting and add the country code for 10-digit North American numbers.
+function toE164(raw) {
+  if (raw == null) return null;
+  const digits = String(raw).replace(/[^\d]/g, "");
+  if (!digits) return null;
+  if (digits.length === 10) return "+1" + digits;                     // NANP, missing country code
+  if (digits.length === 11 && digits[0] === "1") return "+" + digits; // NANP with leading 1
+  return "+" + digits;                                                // already includes a country code
+}
 function canCall(toNumber) {
   const h = callHistory[toNumber];
   if (!h) return { ok: true };
@@ -374,27 +386,36 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
   batches.set(batchId, { lines, connected: false, done: false, market });
 
   await Promise.all(leads.slice(0, Math.max(1, Math.min(10, count))).map(async (ld) => {
+    // Clean the number to +E164 FIRST. Messy formats like "+(647)513-8747" are
+    // rejected by Telnyx (error 10016), and normalizing up front also means the
+    // cap/dedup checks treat the same number as one, not two.
+    const to = toE164(ld.to);
+    if (!to) {
+      console.log("SKIPPED unreadable number", JSON.stringify(ld.to));
+      lines.set("badnum_" + ld.leadId, { leadId: ld.leadId, to: ld.to, status: "blocked", attempt: ld.attempt || 0, fromNumber: "-" });
+      return;
+    }
     // BACKEND SAFETY: refuse to call a number that's hit its cap or was just
     // called. This is the hard guarantee against calling anyone 20x in a row.
-    const gate = canCall(ld.to);
+    const gate = canCall(to);
     if (!gate.ok) {
-      console.log("BLOCKED re-dial of", ld.to, "—", gate.reason);
-      lines.set("blocked_" + ld.leadId, { leadId: ld.leadId, to: ld.to, status: "blocked", attempt: ld.attempt || 0, fromNumber: "-" });
+      console.log("BLOCKED re-dial of", to, "—", gate.reason);
+      lines.set("blocked_" + ld.leadId, { leadId: ld.leadId, to, status: "blocked", attempt: ld.attempt || 0, fromNumber: "-" });
       return;
     }
     // Never re-dial a lead that's already been dispositioned (server-side memory,
     // survives device switches and CSV re-imports).
-    if (isDispositioned(ld.to)) {
-      console.log("SKIPPED already-dispositioned lead", ld.to, "—", dispositions[ld.to].status);
-      lines.set("dispo_" + ld.leadId, { leadId: ld.leadId, to: ld.to, status: "done", attempt: ld.attempt || 0, fromNumber: "-" });
+    if (isDispositioned(to)) {
+      console.log("SKIPPED already-dispositioned lead", to, "—", dispositions[to].status);
+      lines.set("dispo_" + ld.leadId, { leadId: ld.leadId, to, status: "done", attempt: ld.attempt || 0, fromNumber: "-" });
       return;
     }
     const from = pickFrom();
     try {
-      recordCallAttempt(ld.to, ld.name); // count the attempt BEFORE dialing, so a crash mid-dial still counts
+      recordCallAttempt(to, ld.name); // count the attempt BEFORE dialing, so a crash mid-dial still counts
       const call = await telnyx("/calls", {
         connection_id: CONNECTION_ID,
-        to: ld.to,
+        to,
         from,
         webhook_url: `${PUBLIC_URL}/webhook`,
         client_state: b64({ batchId, leadId: ld.leadId }),
@@ -404,7 +425,7 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
       });
       const ccid = call?.data?.call_control_id;
       if (ccid) {
-        lines.set(ccid, { leadId: ld.leadId, to: ld.to, status: "dialing", attempt: ld.attempt || 0, fromNumber: from });
+        lines.set(ccid, { leadId: ld.leadId, to, status: "dialing", attempt: ld.attempt || 0, fromNumber: from });
         recordPlaced(from);
         recordCallSuccess();
       } else {
@@ -412,11 +433,11 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
         const err = call?.errors?.[0] || {};
         const reason = describeTelnyxError(err.code, err.detail, call?._httpStatus);
         recordCallFailure(reason, err.code);
-        console.log("Call failed for", ld.to, "—", reason);
+        console.log("Call failed for", to, "—", reason);
       }
     } catch (e) {
       recordCallFailure("Network error reaching Telnyx — backend may be offline or rate-limited.", null);
-      console.log("Call error for", ld.to, ":", e.message);
+      console.log("Call error for", to, ":", e.message);
     }
   }));
 
@@ -772,16 +793,18 @@ let directCallPending = null;
 app.post("/direct-call", async (req, res) => {
   const { myPhone, to } = req.body || {};
   if (!myPhone || !to) return res.status(400).json({ error: "need myPhone and to" });
+  const toClean = toE164(to);
+  if (!toClean) return res.status(400).json({ error: "invalid 'to' number" });
   const from = FROM_NUMBERS[0] || "";
   directCallPending = null;
   try {
-    console.log("Direct call: calling your phone", myPhone, "then will dial", to);
+    console.log("Direct call: calling your phone", myPhone, "then will dial", toClean);
     const call1 = await telnyx("/calls", {
       connection_id: CONNECTION_ID, to: ringMe(myPhone), from,
       webhook_url: `${PUBLIC_URL}/webhook`,
     });
     const ccid = call1?.data?.call_control_id;
-    directCallPending = { seanCcid: ccid, to, from };
+    directCallPending = { seanCcid: ccid, to: toClean, from };
     console.log("Direct call: your call ID =", ccid);
     res.json({ ok: true, callId: ccid });
   } catch (e) { console.error("Direct call error:", e); res.status(500).json({ error: e.message }); }
@@ -793,6 +816,8 @@ app.post("/direct-call", async (req, res) => {
 app.post("/call-back", async (req, res) => {
   const { myPhone, to, fromNumber } = req.body || {};
   if (!myPhone || !to) return res.status(400).json({ error: "need myPhone and to" });
+  const toClean = toE164(to);
+  if (!toClean) return res.status(400).json({ error: "invalid 'to' number" });
   const from = fromNumber || FROM_NUMBERS[0] || "";
   if (!from) return res.status(500).json({ error: "no FROM number" });
   try {
@@ -800,7 +825,7 @@ app.post("/call-back", async (req, res) => {
     const call1 = await telnyx("/calls", {
       connection_id: CONNECTION_ID, to: ringMe(myPhone), from,
       webhook_url: `${PUBLIC_URL}/webhook`,
-      client_state: b64({ callback: true, callbackTo: to, callbackFrom: from }),
+      client_state: b64({ callback: true, callbackTo: toClean, callbackFrom: from }),
     });
     res.json({ ok: true, callId: call1?.data?.call_control_id });
   } catch (e) { res.status(500).json({ error: e.message }); }

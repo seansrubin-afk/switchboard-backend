@@ -35,12 +35,12 @@ const MY_PHONE         = process.env.MY_PHONE || "";
 const SIP_DESTINATION  = process.env.SIP_DESTINATION || "";
 const ringMe = (phoneFallback) => SIP_DESTINATION || phoneFallback || MY_PHONE;
 
-// Automatic voicemail drop. When on (the default), each lead call runs answering-
-// machine detection: real humans get connected to you, machines get your pre-recorded
-// voicemail dropped automatically. This adds roughly 1-2s of detection per call. Set
-// VM_AUTO=off in Railway to turn it off and revert to instant, zero-delay connect with
-// no voicemail drop (your exact previous behavior).
-const VM_AUTO = String(process.env.VM_AUTO ?? "on").toLowerCase() !== "off";
+// Automatic voicemail drop. DEFAULT OFF, because answering-machine detection was
+// timing out on every call in production (adding a ~4s silent pause before each
+// connect and not reliably detecting machines). Off means instant connect the moment
+// a lead answers, exactly like the original. Set VM_AUTO=on in Railway to try the
+// voicemail drop again (only worth it if premium detection is actually working).
+const VM_AUTO = String(process.env.VM_AUTO ?? "off").toLowerCase() === "on";
 // Detection engine: "premium" (most accurate at telling humans from machines, small
 // per-call cost) or "detect" (standard, free, a bit less accurate). Only used when
 // VM_AUTO is on. Change with the AMD_MODE Railway variable.
@@ -469,7 +469,9 @@ async function bridgeLeadToSean(ccid, batch, line) {
   if (!line) return;
   if (line.amdTimer) { clearTimeout(line.amdTimer); line.amdTimer = null; }
   line.awaitingAMD = false;
-  // GLOBAL one-at-a-time guard.
+  // GLOBAL one-at-a-time guard. CLAIM the slot synchronously, before any await,
+  // so two webhooks firing at the same instant (e.g. two detection timeouts
+  // expiring together) can't both pass the check and both connect.
   if (session.leadOnLine || batch.connected) {
     line.status = "dropped";
     action(ccid, "hangup").catch(() => {});
@@ -480,16 +482,20 @@ async function bridgeLeadToSean(ccid, batch, line) {
     action(ccid, "hangup").catch(() => {});
     return;
   }
-  const seanAlive = await isLegAlive(session.seanCallId);
-  if (!seanAlive) {
-    console.error("LEAD DROPPED — Sean's conference leg not live. Not connecting.");
-    action(ccid, "hangup").catch(() => {});
-    session.seanUp = false; session.seanCallId = null;
-    return;
-  }
+  // Claim NOW, before the async leg-check, so no other lead can slip into the gap.
   session.leadOnLine = true;
   session.connectedLeadCcid = ccid;
   batch.connected = true;
+  const seanAlive = await isLegAlive(session.seanCallId);
+  if (!seanAlive) {
+    console.error("LEAD DROPPED — Sean's conference leg not live. Not connecting.");
+    session.leadOnLine = false;
+    session.connectedLeadCcid = null;
+    batch.connected = false;
+    session.seanUp = false; session.seanCallId = null;
+    action(ccid, "hangup").catch(() => {});
+    return;
+  }
   line.status = "connected";
   recordOutcome(line.to, "connected");
   console.log("Lead is a human — joining to conference", session.confId, ":", ccid);

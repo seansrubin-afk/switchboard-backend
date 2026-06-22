@@ -78,6 +78,35 @@ let rrIndex = 0;
 const MAX_ATTEMPTS_PER_NUMBER = 3;        // absolute max calls to one number, ever, per server run
 const MIN_SECONDS_BETWEEN_CALLS = 90;     // a number cannot be re-dialed within this window
 const callHistory = {};                   // { "+1leadphone": { attempts, lastCalledAt } }
+
+// ---------------------------------------------------------------------------
+// DAILY RESET of the per-number attempt cap.
+// The 3-attempt cap is meant to stop us calling one business too many times in
+// a DAY, not forever. callHistory lives in memory, so without this it just keeps
+// growing across every session until the Railway server is restarted. That
+// silently locks numbers out ("max 3 attempts reached") even after the app's
+// front end has been reset, which is exactly what makes the dialer look frozen
+// and re-dial the same blocked number forever. We clear the attempt counts once
+// per day at local midnight so numbers free up on their own. Defaults to UTC+8
+// (Bali); override with the DAILY_RESET_UTC_OFFSET env var. Dispositions
+// (no / booked / interested) are intentionally NOT touched, so a "no" stays a "no".
+// ---------------------------------------------------------------------------
+const DAILY_RESET_UTC_OFFSET = Number(process.env.DAILY_RESET_UTC_OFFSET ?? 8);
+let resetDayKey = null;
+function localDayKey() {
+  const shifted = new Date(Date.now() + DAILY_RESET_UTC_OFFSET * 3600 * 1000);
+  return shifted.toISOString().slice(0, 10); // YYYY-MM-DD in the chosen timezone
+}
+function maybeDailyReset() {
+  const today = localDayKey();
+  if (resetDayKey === null) { resetDayKey = today; return; }
+  if (today !== resetDayKey) {
+    const cleared = Object.keys(callHistory).length;
+    for (const k in callHistory) delete callHistory[k];
+    resetDayKey = today;
+    console.log(`Daily reset — cleared attempt counts for ${cleared} number(s); new day ${today} (UTC+${DAILY_RESET_UTC_OFFSET})`);
+  }
+}
 // Normalize any phone number to clean +E164 before dialing. Lead lists are messy:
 // numbers come in as "+(647)513-8747", "(647) 513-8747", or "647-513-8747", and
 // Telnyx rejects anything that isn't strictly "+" followed by digits (error 10016).
@@ -91,6 +120,7 @@ function toE164(raw) {
   return "+" + digits;                                                // already includes a country code
 }
 function canCall(toNumber) {
+  maybeDailyReset();                        // free up numbers if the day has rolled over
   const h = callHistory[toNumber];
   if (!h) return { ok: true };
   if (h.attempts >= MAX_ATTEMPTS_PER_NUMBER)
@@ -1010,5 +1040,20 @@ app.get("/health", async (_req, res) => {
   });
 });
 
+// Manual "clear the locked-number memory" button. Same effect as restarting the
+// Railway server, but instant and no redeploy. If numbers are stuck on
+// "max 3 attempts reached" and you want them callable again right now, just open
+//   https://<your-railway-url>/reset-attempts
+// in a browser tab (GET works, so the URL bar is enough), or POST to it.
+function doResetAttempts(req, res) {
+  const cleared = Object.keys(callHistory).length;
+  for (const k in callHistory) delete callHistory[k];
+  resetDayKey = localDayKey();
+  console.log(`Manual reset — cleared attempt counts for ${cleared} number(s)`);
+  res.json({ ok: true, cleared, message: `Cleared ${cleared} number(s). All leads are callable again.` });
+}
+app.get("/reset-attempts", doResetAttempts);
+app.post("/reset-attempts", doResetAttempts);
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.8.2 backend listening on :${PORT}`));
+app.listen(PORT, () => console.log(`Switchboard v3.9.0 backend listening on :${PORT} — daily attempt-reset at local midnight (UTC+${DAILY_RESET_UTC_OFFSET})`));

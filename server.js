@@ -115,6 +115,12 @@ function normalizeMarket(m) {
   if (!m) return null;
   return MARKET_ALIASES[String(m).trim().toUpperCase()] || null;
 }
+// HARD OVERRIDE. If FORCE_MARKET is set in Railway (e.g. FORCE_MARKET=AU), every
+// number is formatted as that country, IGNORING whatever market the frontend sends
+// and ignoring any country code already stuck on the number. Use this when 100% of
+// your leads are from one country and you don't trust the frontend to label them.
+// Leave it unset to go back to per-batch market behaviour.
+const FORCE_MARKET = normalizeMarket(process.env.FORCE_MARKET) || null;
 // Normalize ANY phone number to clean +E164 before dialing. This must survive every
 // messy form the frontend/CSV can produce for the same number:
 //   "0420 754 706", "+0420754706" (a bare + bolted onto a national number),
@@ -122,20 +128,22 @@ function normalizeMarket(m) {
 // The hard rule that makes "+0420..." detectable as junk: a real international number
 // never has 0 as the first digit after the +, because country codes never start with
 // 0. So "+0..." is treated as a national number, not as already-formatted.
-// `market` (e.g. "AU") supplies the country code; if it's missing/unrecognized we fall
-// back to DEFAULT_MARKET so a blank dropdown can't silently send a US +1.
+// Priority for the country code: FORCE_MARKET (if set) > market arg > DEFAULT_MARKET.
 function toE164(raw, market) {
   if (raw == null) return null;
   const s = String(raw).trim();
   if (!s) return null;
-  const mkt  = normalizeMarket(market) || normalizeMarket(DEFAULT_MARKET) || "US";
+  const mkt  = FORCE_MARKET || normalizeMarket(market) || normalizeMarket(DEFAULT_MARKET) || "US";
   const code = DIAL_CODES[mkt];
   const hadPlus = s.startsWith("+");
   const digits  = s.replace(/[^\d]/g, "");
   if (!digits) return null;
-  // Genuinely international only if it had a + AND the first digit isn't 0.
-  // ("+0..." fails this and drops through to national handling below.)
-  if (hadPlus && !digits.startsWith("0")) return "+" + digits;
+  // When FORCING a market, never trust an existing country code on the number — the
+  // leads arrive as national digits with at most a stray "0" or a bolted-on "+", so we
+  // always strip to the national number and re-apply the forced code (handled below).
+  // When NOT forcing: a number is genuinely international only if it had a + AND the
+  // first digit isn't 0 ("+0..." fails this and is treated as national).
+  if (!FORCE_MARKET && hadPlus && !digits.startsWith("0")) return "+" + digits;
   // ---- National format from here (no +, or the bogus "+0..." case) ----
   // North America (or unknown market): preserve the original behaviour.
   if (!code || mkt === "US" || mkt === "CA") {
@@ -143,8 +151,13 @@ function toE164(raw, market) {
     if (digits.length === 11 && digits[0] === "1") return "+" + digits; // NANP with leading 1
     return "+" + digits;
   }
-  // AU / NZ / IE / UK: drop the leading national trunk 0(s), then prepend the code.
-  const national = digits.replace(/^0+/, "");
+  // AU / NZ / IE / UK national number. When FORCING a market we never trust a country
+  // code already on the number, so first strip a wrongly-applied US "1" code — the
+  // pattern "1" immediately followed by a national trunk "0" (e.g. "10421561932" =
+  // bogus 1 + 0421561932). Then drop the trunk 0(s) and prepend the real code.
+  let d2 = digits;
+  if (FORCE_MARKET && d2.length >= 11 && d2[0] === "1" && d2[1] === "0") d2 = d2.slice(1);
+  const national = d2.replace(/^0+/, "");
   if (national.startsWith(code)) return "+" + national; // already carried its code
   return "+" + code + national;
 }
@@ -420,6 +433,7 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
     // and normalizing up front also means the cap/dedup checks treat the same number
     // as one, not two.
     const to = toE164(ld.to, market);
+    console.log("FORMAT raw=" + JSON.stringify(ld.to) + " market=" + JSON.stringify(market) + " force=" + (FORCE_MARKET || "-") + " -> " + to);
     if (!to) {
       console.log("SKIPPED unreadable number", JSON.stringify(ld.to));
       lines.set("badnum_" + ld.leadId, { leadId: ld.leadId, to: ld.to, status: "blocked", attempt: ld.attempt || 0, fromNumber: "-" });
@@ -1016,4 +1030,4 @@ function doResetAttempts(req, res) {
 app.get("/reset-attempts", doResetAttempts);
 app.post("/reset-attempts", doResetAttempts);
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v3.9.0 backend listening on :${PORT} — daily attempt-reset at local midnight (UTC+${DAILY_RESET_UTC_OFFSET})`));
+app.listen(PORT, () => console.log(`Switchboard v4.0.0-AUFIX backend listening on :${PORT} — FORCE_MARKET=${FORCE_MARKET || "(unset)"} — daily attempt-reset at local midnight (UTC+${DAILY_RESET_UTC_OFFSET})`));

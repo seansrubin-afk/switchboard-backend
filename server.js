@@ -23,7 +23,7 @@ const CONNECTION_ID    = process.env.TELNYX_CONNECTION_ID;
 const DEFAULT_FROM_NUMBERS = "+13159232442,+17852024556,+16363302146";
 let   FROM_NUMBERS      = (process.env.FROM_NUMBERS || DEFAULT_FROM_NUMBERS).split(",").map(s => s.trim()).filter(Boolean);
 const PUBLIC_URL       = process.env.PUBLIC_URL;
-const DEFAULT_MARKET   = (process.env.DEFAULT_MARKET || "US").toUpperCase();
+const DEFAULT_MARKET   = (process.env.DEFAULT_MARKET || "AU").toUpperCase();
 const MY_PHONE         = process.env.MY_PHONE || "";
 // If set (e.g. "sip:myusername@sip.telnyx.com"), the Switchboard rings this SIP
 // softphone over the internet instead of the PSTN number. Fixes laggy WiFi-Calling
@@ -98,31 +98,52 @@ function maybeDailyReset() {
   }
 }
 // Country dial codes for the markets we call. Add a market here to support a new
-// country (key = the market code the frontend sends, value = its phone country code).
+// country (key = the market code, value = its phone country code).
 const DIAL_CODES = { US: "1", CA: "1", AU: "61", NZ: "64", IE: "353", UK: "44", GB: "44" };
-// Normalize any phone number to clean +E164 before dialing. Lead lists are messy and
-// country-specific: AU/UK/IE/NZ national numbers carry a leading "0" trunk digit that
-// must be DROPPED and replaced with the country code, or Telnyx rejects them (D11
-// "destination number invalid"). `market` (e.g. "AU") tells us which code to add.
+// Accept whatever the frontend or env sends for the market — "au", "Australia",
+// "AUS" all mean AU — and map it to a code we know how to format. Unknown/blank
+// returns null so the caller can fall back to DEFAULT_MARKET.
+const MARKET_ALIASES = {
+  AU: "AU", AUS: "AU", AUSTRALIA: "AU",
+  NZ: "NZ", NZL: "NZ", "NEW ZEALAND": "NZ",
+  IE: "IE", IRL: "IE", IRELAND: "IE",
+  UK: "UK", GB: "UK", GBR: "UK", "UNITED KINGDOM": "UK", BRITAIN: "UK",
+  US: "US", USA: "US", "UNITED STATES": "US",
+  CA: "CA", CAN: "CA", CANADA: "CA",
+};
+function normalizeMarket(m) {
+  if (!m) return null;
+  return MARKET_ALIASES[String(m).trim().toUpperCase()] || null;
+}
+// Normalize ANY phone number to clean +E164 before dialing. This must survive every
+// messy form the frontend/CSV can produce for the same number:
+//   "0420 754 706", "+0420754706" (a bare + bolted onto a national number),
+//   "61420754706", "+61 420 754 706"  -> all must become "+61420754706".
+// The hard rule that makes "+0420..." detectable as junk: a real international number
+// never has 0 as the first digit after the +, because country codes never start with
+// 0. So "+0..." is treated as a national number, not as already-formatted.
+// `market` (e.g. "AU") supplies the country code; if it's missing/unrecognized we fall
+// back to DEFAULT_MARKET so a blank dropdown can't silently send a US +1.
 function toE164(raw, market) {
   if (raw == null) return null;
   const s = String(raw).trim();
-  // Already +E164 (e.g. a phone_e164 column) — strip formatting, keep the +, trust it.
-  if (s.startsWith("+")) {
-    const d = s.replace(/[^\d]/g, "");
-    return d ? "+" + d : null;
-  }
-  const digits = s.replace(/[^\d]/g, "");
-  if (!digits) return null;
-  const mkt  = String(market || "").toUpperCase();
+  if (!s) return null;
+  const mkt  = normalizeMarket(market) || normalizeMarket(DEFAULT_MARKET) || "US";
   const code = DIAL_CODES[mkt];
-  // North America (or unknown market): keep the original behaviour.
+  const hadPlus = s.startsWith("+");
+  const digits  = s.replace(/[^\d]/g, "");
+  if (!digits) return null;
+  // Genuinely international only if it had a + AND the first digit isn't 0.
+  // ("+0..." fails this and drops through to national handling below.)
+  if (hadPlus && !digits.startsWith("0")) return "+" + digits;
+  // ---- National format from here (no +, or the bogus "+0..." case) ----
+  // North America (or unknown market): preserve the original behaviour.
   if (!code || mkt === "US" || mkt === "CA") {
     if (digits.length === 10) return "+1" + digits;                     // NANP, missing country code
     if (digits.length === 11 && digits[0] === "1") return "+" + digits; // NANP with leading 1
     return "+" + digits;
   }
-  // AU / NZ / IE / UK: drop the leading national trunk 0, then prepend the country code.
+  // AU / NZ / IE / UK: drop the leading national trunk 0(s), then prepend the code.
   const national = digits.replace(/^0+/, "");
   if (national.startsWith(code)) return "+" + national; // already carried its code
   return "+" + code + national;

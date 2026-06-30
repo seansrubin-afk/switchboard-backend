@@ -161,6 +161,12 @@ function detectFromPattern(d) {
   if (/^0[1237]\d{9}$/.test(d)) return "+44" + d.slice(1); // UK 11-digit (07 mobile / 01,02,03)
   return null;
 }
+// Known country codes, longest first, so "353" matches before "1" etc.
+const KNOWN_CODES = [...new Set(Object.values(DIAL_CODES))].sort((a, b) => b.length - a.length);
+function matchKnownCode(digits) {
+  for (const c of KNOWN_CODES) if (digits.startsWith(c)) return c;
+  return null;
+}
 function toE164(raw, market) {
   if (raw == null) return null;
   const s = String(raw).trim();
@@ -170,8 +176,17 @@ function toE164(raw, market) {
   const hadPlus = s.startsWith("+");
 
   // (1) Already valid international (+, first digit not 0): pass through, validated.
-  if (!FORCE_MARKET && hadPlus && !digits.startsWith("0"))
+  if (!FORCE_MARKET && hadPlus && !digits.startsWith("0")) {
+    // Guard: a national trunk 0 stuck right after a real country code (e.g.
+    // "+61 0402..." or "+27 (0)82...") is never valid in E.164. Strip it and
+    // reformat by that code. A 0 immediately after a country code is always junk.
+    const cc = matchKnownCode(digits);
+    if (cc && digits[cc.length] === "0") {
+      const e = applyCode(cc, digits.slice(cc.length));
+      if (e) return e;
+    }
     return isValidE164("+" + digits) ? "+" + digits : null;
+  }
 
   // National format from here (no +, or the bogus "+0..." case, or a FORCE override).
   const labelled = normalizeMarket(market);          // (2) explicit per-lead label

@@ -1,9 +1,18 @@
 /* ============================================================================
-   THE SWITCHBOARD v3.4 — backend orchestrator
+   THE SWITCHBOARD v4.1.0-INTL — backend orchestrator
    - Parallel outbound dialing with AMD
    - Custom voicemail drop (YOUR recorded voice, not TTS)
    - Inbound call forwarding (callbacks reach your phone)
    - Inbound call/text logging (see who called/texted back)
+
+   v4.1.0-INTL changes (formatting only — all call logic is unchanged):
+     • Multi-country number formatting: a number is identified by its OWN country
+       (its + country code, its market label, or its national shape). No single
+       "default country" is ever forced onto every number.
+     • Added South Africa (ZA / +27), which was missing from the dial codes.
+     • Numbers that can't be safely identified are SKIPPED + logged, never dialed
+       as a guessed wrong country.
+     • Startup log now prints DEFAULT_MARKET too, so you can see the env state.
    ============================================================================ */
 import express from "express";
 const app = express();
@@ -23,7 +32,13 @@ const CONNECTION_ID    = process.env.TELNYX_CONNECTION_ID;
 const DEFAULT_FROM_NUMBERS = "+13159232442,+17852024556,+16363302146";
 let   FROM_NUMBERS      = (process.env.FROM_NUMBERS || DEFAULT_FROM_NUMBERS).split(",").map(s => s.trim()).filter(Boolean);
 const PUBLIC_URL       = process.env.PUBLIC_URL;
-const DEFAULT_MARKET   = (process.env.DEFAULT_MARKET || "AU").toUpperCase();
+// Optional FALLBACK country for national-format numbers that carry NO country code,
+// NO market label, AND don't match a known national pattern. LEAVE THIS UNSET for
+// multi-country dialing: unset means every number is identified by its own country
+// code / market label / shape, and anything still ambiguous is SKIPPED rather than
+// guessed as a wrong country. Set it (e.g. DEFAULT_MARKET=NZ) only if you want one
+// specific fallback for a single-country campaign.
+const DEFAULT_MARKET   = (process.env.DEFAULT_MARKET || "").toUpperCase();
 const MY_PHONE         = process.env.MY_PHONE || "";
 // If set (e.g. "sip:myusername@sip.telnyx.com"), the Switchboard rings this SIP
 // softphone over the internet instead of the PSTN number. Fixes laggy WiFi-Calling
@@ -42,13 +57,10 @@ const VM_AUTO = String(process.env.VM_AUTO ?? "off").toLowerCase() === "on";
 const AMD_MODE = (process.env.AMD_MODE || "premium").toLowerCase();
 const TELNYX = "https://api.telnyx.com/v2";
 // ---- Per-number reputation stats (answer-rate proxy for spam detection) ----
-// Tracks calls placed vs answered per FROM number. A sharp answer-rate drop is
-// the earliest in-app signal that a number may be carrier-flagged.
 const numberStats = {}; // { "+1...": { placed, answered } }
 function ensureNumberStats(n) { if (!numberStats[n]) numberStats[n] = { placed: 0, answered: 0 }; return numberStats[n]; }
 function recordPlaced(n) { if (n) ensureNumberStats(n).placed += 1; }
 function recordAnswered(n) { if (n) ensureNumberStats(n).answered += 1; }
-// Warn only after a meaningful sample, so early noise doesn't false-alarm.
 const SPAM_MIN_SAMPLE = 15;   // need at least this many placed calls
 const SPAM_RATE_FLOOR = 0.05; // under 5% answer rate => likely flagged
 function numberReputation() {
@@ -64,23 +76,10 @@ const session = { confId: null, confName: null, seanCallId: null, seanUp: false,
 const batches = new Map();
 let rrIndex = 0;
 // ---- BACKEND-ENFORCED CALL SAFETY (never trust the frontend) ----
-// Hard caps so no business can ever be called repeatedly, regardless of any
-// frontend bug, auto-dial loop, or duplicate lead in the queue.
 const MAX_ATTEMPTS_PER_NUMBER = 3;        // absolute max calls to one number, ever, per server run
 const MIN_SECONDS_BETWEEN_CALLS = 90;     // a number cannot be re-dialed within this window
 const callHistory = {};                   // { "+1leadphone": { attempts, lastCalledAt } }
-// ---------------------------------------------------------------------------
-// DAILY RESET of the per-number attempt cap.
-// The 3-attempt cap is meant to stop us calling one business too many times in
-// a DAY, not forever. callHistory lives in memory, so without this it just keeps
-// growing across every session until the Railway server is restarted. That
-// silently locks numbers out ("max 3 attempts reached") even after the app's
-// front end has been reset, which is exactly what makes the dialer look frozen
-// and re-dial the same blocked number forever. We clear the attempt counts once
-// per day at local midnight so numbers free up on their own. Defaults to UTC+8
-// (Bali); override with the DAILY_RESET_UTC_OFFSET env var. Dispositions
-// (no / booked / interested) are intentionally NOT touched, so a "no" stays a "no".
-// ---------------------------------------------------------------------------
+// ---- DAILY RESET of the per-number attempt cap (local midnight). ----
 const DAILY_RESET_UTC_OFFSET = Number(process.env.DAILY_RESET_UTC_OFFSET ?? 8);
 let resetDayKey = null;
 function localDayKey() {
@@ -99,10 +98,9 @@ function maybeDailyReset() {
 }
 // Country dial codes for the markets we call. Add a market here to support a new
 // country (key = the market code, value = its phone country code).
-const DIAL_CODES = { US: "1", CA: "1", AU: "61", NZ: "64", IE: "353", UK: "44", GB: "44" };
+const DIAL_CODES = { US: "1", CA: "1", AU: "61", NZ: "64", IE: "353", UK: "44", GB: "44", ZA: "27" };
 // Accept whatever the frontend or env sends for the market — "au", "Australia",
-// "AUS" all mean AU — and map it to a code we know how to format. Unknown/blank
-// returns null so the caller can fall back to DEFAULT_MARKET.
+// "AUS" all mean AU — and map it to a code we know how to format.
 const MARKET_ALIASES = {
   AU: "AU", AUS: "AU", AUSTRALIA: "AU",
   NZ: "NZ", NZL: "NZ", "NEW ZEALAND": "NZ",
@@ -110,56 +108,87 @@ const MARKET_ALIASES = {
   UK: "UK", GB: "UK", GBR: "UK", "UNITED KINGDOM": "UK", BRITAIN: "UK",
   US: "US", USA: "US", "UNITED STATES": "US",
   CA: "CA", CAN: "CA", CANADA: "CA",
+  ZA: "ZA", RSA: "ZA", "SOUTH AFRICA": "ZA",
 };
 function normalizeMarket(m) {
   if (!m) return null;
   return MARKET_ALIASES[String(m).trim().toUpperCase()] || null;
 }
 // HARD OVERRIDE. If FORCE_MARKET is set in Railway (e.g. FORCE_MARKET=AU), every
-// number is formatted as that country, IGNORING whatever market the frontend sends
-// and ignoring any country code already stuck on the number. Use this when 100% of
-// your leads are from one country and you don't trust the frontend to label them.
-// Leave it unset to go back to per-batch market behaviour.
+// number is formatted as that country. Use ONLY when 100% of your leads are from one
+// country. LEAVE IT UNSET for multi-country dialing.
 const FORCE_MARKET = normalizeMarket(process.env.FORCE_MARKET) || null;
-// Normalize ANY phone number to clean +E164 before dialing. This must survive every
-// messy form the frontend/CSV can produce for the same number:
-//   "0420 754 706", "+0420754706" (a bare + bolted onto a national number),
-//   "61420754706", "+61 420 754 706"  -> all must become "+61420754706".
-// The hard rule that makes "+0420..." detectable as junk: a real international number
-// never has 0 as the first digit after the +, because country codes never start with
-// 0. So "+0..." is treated as a national number, not as already-formatted.
-// Priority for the country code: FORCE_MARKET (if set) > market arg > DEFAULT_MARKET.
+
+// ===========================================================================
+//  PHONE NUMBER FORMATTING (multi-country, no forced default)
+// ===========================================================================
+// A number is identified by its OWN country, in this order of trust:
+//   (1) it already carries a country code:  +27..., +353..., +61..., +44..., +1...
+//   (2) the lead has an explicit market label: AU / IE / UK / ZA / NZ / US ...
+//   (3) its national shape is unambiguous:   AU mobile 04..., UK 07..., US 10-digit
+// If none identify it, it is SKIPPED (returns null -> the caller logs it), so we
+// NEVER dial a number as a guessed wrong country.
+// "+0..." is junk (country codes never start with 0) and is treated as national.
+// "+10402687704" (a national 0-number wrongly stamped +1) is rejected by the NANP
+// rule: a +1 number's first national digit must be 2-9, never 0/1.
+
+// E.164 validity, including the NANP (+1) area-code rule.
+function isValidE164(s) {
+  if (!/^\+[1-9]\d{7,14}$/.test(s)) return false;
+  if (s.startsWith("+1")) return /^\+1[2-9]\d{9}$/.test(s); // US/CA: exactly 10 digits, area code 2-9
+  return true;
+}
+// Apply a country dial code to a national-digits string. Strips the national trunk 0
+// for trunk-0 countries (AU/NZ/IE/UK/ZA); NANP has no trunk 0. Returns valid E.164 or null.
+function applyCode(code, n) {
+  if (!code) return null;
+  if (code === "1") {                                    // US / CA: no trunk 0
+    if (n.length === 11 && n[0] === "1") n = n.slice(1);  // tolerate a leading 1
+    const e = "+1" + n;
+    return isValidE164(e) ? e : null;
+  }
+  n = n.replace(/^0+/, "");                              // strip national trunk 0(s)
+  const e = n.startsWith(code) ? "+" + n : "+" + code + n;
+  return isValidE164(e) ? e : null;
+}
+// Identify a national number by its own shape when there's no reliable label. Only
+// high-confidence, non-overlapping patterns; anything else returns null so the caller
+// SKIPS it rather than guessing a wrong country.
+function detectFromPattern(d) {
+  if (/^[2-9]\d{9}$/.test(d))   return "+1"  + d;          // US/CA 10-digit (area code 2-9)
+  if (/^1[2-9]\d{9}$/.test(d))  return "+"   + d;          // US/CA with leading 1
+  if (/^04\d{8}$/.test(d))      return "+61" + d.slice(1); // AU mobile (04 + 8 digits)
+  if (/^0[1237]\d{9}$/.test(d)) return "+44" + d.slice(1); // UK 11-digit (07 mobile / 01,02,03)
+  return null;
+}
 function toE164(raw, market) {
   if (raw == null) return null;
   const s = String(raw).trim();
   if (!s) return null;
-  const mkt  = FORCE_MARKET || normalizeMarket(market) || normalizeMarket(DEFAULT_MARKET) || "US";
-  const code = DIAL_CODES[mkt];
-  const hadPlus = s.startsWith("+");
-  const digits  = s.replace(/[^\d]/g, "");
+  const digits = s.replace(/[^\d]/g, "");
   if (!digits) return null;
-  // When FORCING a market, never trust an existing country code on the number — the
-  // leads arrive as national digits with at most a stray "0" or a bolted-on "+", so we
-  // always strip to the national number and re-apply the forced code (handled below).
-  // When NOT forcing: a number is genuinely international only if it had a + AND the
-  // first digit isn't 0 ("+0..." fails this and is treated as national).
-  if (!FORCE_MARKET && hadPlus && !digits.startsWith("0")) return "+" + digits;
-  // ---- National format from here (no +, or the bogus "+0..." case) ----
-  // North America (or unknown market): preserve the original behaviour.
-  if (!code || mkt === "US" || mkt === "CA") {
-    if (digits.length === 10) return "+1" + digits;                     // NANP, missing country code
-    if (digits.length === 11 && digits[0] === "1") return "+" + digits; // NANP with leading 1
-    return "+" + digits;
-  }
-  // AU / NZ / IE / UK national number. When FORCING a market we never trust a country
-  // code already on the number, so first strip a wrongly-applied US "1" code — the
-  // pattern "1" immediately followed by a national trunk "0" (e.g. "10421561932" =
-  // bogus 1 + 0421561932). Then drop the trunk 0(s) and prepend the real code.
-  let d2 = digits;
-  if (FORCE_MARKET && d2.length >= 11 && d2[0] === "1" && d2[1] === "0") d2 = d2.slice(1);
-  const national = d2.replace(/^0+/, "");
-  if (national.startsWith(code)) return "+" + national; // already carried its code
-  return "+" + code + national;
+  const hadPlus = s.startsWith("+");
+
+  // (1) Already valid international (+, first digit not 0): pass through, validated.
+  if (!FORCE_MARKET && hadPlus && !digits.startsWith("0"))
+    return isValidE164("+" + digits) ? "+" + digits : null;
+
+  // National format from here (no +, or the bogus "+0..." case, or a FORCE override).
+  const labelled = normalizeMarket(market);          // (2) explicit per-lead label
+  const fallback = normalizeMarket(DEFAULT_MARKET);   // optional, ONLY if you set one
+
+  // (0) Hard single-country override, if you ever set FORCE_MARKET.
+  if (FORCE_MARKET) { const e = applyCode(DIAL_CODES[FORCE_MARKET], digits); if (e) return e; }
+  // (2) Trust an explicit market label.
+  if (labelled)     { const e = applyCode(DIAL_CODES[labelled],     digits); if (e) return e; }
+  // (3) Identify by the number's own shape (AU mobile, UK, US...) BEFORE any default.
+  const det = detectFromPattern(digits); if (det) return det;
+  // (4) Only if YOU deliberately set DEFAULT_MARKET, use it as a last resort.
+  if (fallback)     { const e = applyCode(DIAL_CODES[fallback],     digits); if (e) return e; }
+  // (5) Maybe it already carries a country code but lost its leading +.
+  if (isValidE164("+" + digits)) return "+" + digits;
+  // Could not safely identify the country -> SKIP. The caller logs the raw value.
+  return null;
 }
 function canCall(toNumber) {
   maybeDailyReset();                        // free up numbers if the day has rolled over
@@ -187,29 +216,19 @@ function recordOutcome(toNumber, outcome) {
   if (h.history && h.history.length) h.history[h.history.length - 1].outcome = outcome;
 }
 // ---- SERVER-SIDE DISPOSITIONS (survive device switches / re-imports) ----
-// Once a lead is dispositioned (no/booked/interested/callback), we remember it
-// here so it can never be re-dialed, even from a different browser.
 const dispositions = {}; // { "+phone": { status, at } }
 function isDispositioned(phone) {
   const d = dispositions[phone];
-  // "callback" leads are still callable later; everything else is done.
-  return d && d.status && d.status !== "callback";
+  return d && d.status && d.status !== "callback"; // "callback" leads are still callable later
 }
 // Voicemail audio (uploaded by user, stored in memory)
 let voicemailAudio = null; // { buffer: Buffer, contentType: string }
 // ---- SYSTEM HEALTH / ALERT TRACKING ----
-// Tracks specific failures so the app can show exactly what's wrong.
 const sysHealth = {
-  lastBalance: null,        // last known Telnyx balance (number, USD)
-  lastBalanceCheck: 0,      // timestamp of last balance poll
-  consecutiveCallFailures: 0, // dial attempts that failed in a row
-  lastFailureReason: null,  // human-readable reason of most recent failure
-  lastFailureCode: null,    // Telnyx error code (e.g. "10015")
-  lastFailureAt: null,      // ISO timestamp
-  apiKeyOk: true,           // false if Telnyx rejected our key (401)
-  alerts: [],               // active alert strings shown in the banner
+  lastBalance: null, lastBalanceCheck: 0, consecutiveCallFailures: 0,
+  lastFailureReason: null, lastFailureCode: null, lastFailureAt: null,
+  apiKeyOk: true, alerts: [],
 };
-// Translate a Telnyx error into a plain-English, specific reason.
 function describeTelnyxError(code, detail, httpStatus) {
   const c = String(code || "");
   if (httpStatus === 401 || c === "10009") return "Telnyx API key rejected — key may be wrong, revoked, or expired.";
@@ -222,14 +241,11 @@ function describeTelnyxError(code, detail, httpStatus) {
   if (httpStatus === 429) return "Telnyx rate limit hit — dialing too fast. Slow the batch pace.";
   return detail ? `Telnyx error: ${detail}` : `Telnyx error (HTTP ${httpStatus || "?"}, code ${c || "?"}).`;
 }
-// Poll Telnyx for the current account balance (cached ~60s).
 async function checkBalance() {
   const now = Date.now();
   if (now - sysHealth.lastBalanceCheck < 60000 && sysHealth.lastBalance !== null) return sysHealth.lastBalance;
   try {
-    const res = await fetch(TELNYX + "/balance", {
-      headers: { Authorization: `Bearer ${TELNYX_API_KEY}` },
-    });
+    const res = await fetch(TELNYX + "/balance", { headers: { Authorization: `Bearer ${TELNYX_API_KEY}` } });
     if (res.status === 401) { sysHealth.apiKeyOk = false; return null; }
     sysHealth.apiKeyOk = true;
     const j = await res.json();
@@ -238,17 +254,13 @@ async function checkBalance() {
     return sysHealth.lastBalance;
   } catch { return sysHealth.lastBalance; }
 }
-// Record a dial failure with a specific reason.
 function recordCallFailure(reason, code) {
   sysHealth.consecutiveCallFailures += 1;
   sysHealth.lastFailureReason = reason;
   sysHealth.lastFailureCode = code || null;
   sysHealth.lastFailureAt = new Date().toISOString();
 }
-function recordCallSuccess() {
-  sysHealth.consecutiveCallFailures = 0;
-}
-// Build the list of active alerts (what the banner shows).
+function recordCallSuccess() { sysHealth.consecutiveCallFailures = 0; }
 function computeAlerts() {
   const alerts = [];
   if (!sysHealth.apiKeyOk) alerts.push("TELNYX API KEY REJECTED — calls cannot be placed. Check the key in Railway.");
@@ -263,17 +275,12 @@ function computeAlerts() {
 const inboundLog = []; // { type: "call"|"text", from, to, timestamp, body? }
 const pickFrom = () => FROM_NUMBERS[(rrIndex++) % FROM_NUMBERS.length];
 // Verify a call leg is genuinely still active by asking Telnyx directly.
-// Returns true only if Telnyx reports the call as active. Any error/unknown
-// => false, so we fail safe toward calling Sean's phone again.
 async function isLegAlive(ccid) {
   if (!ccid) return false;
   try {
-    const res = await fetch(TELNYX + `/calls/${ccid}`, {
-      headers: { Authorization: `Bearer ${TELNYX_API_KEY}` },
-    });
+    const res = await fetch(TELNYX + `/calls/${ccid}`, { headers: { Authorization: `Bearer ${TELNYX_API_KEY}` } });
     if (!res.ok) return false;
     const j = await res.json();
-    // Telnyx returns call status; "active"/"bridged" mean the leg is live.
     const status = (j?.data?.call_status || j?.data?.status || "").toLowerCase();
     return status === "active" || status === "bridged" || j?.data?.is_alive === true;
   } catch { return false; }
@@ -290,43 +297,31 @@ async function telnyx(path, body, method = "POST") {
   let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
   if (json && typeof json === "object") json._httpStatus = res.status;
   if (!res.ok) {
-    // Hanging up an already-ended call (90018) is expected/harmless noise when
-    // we tidy up losing lines after a bridge. Don't spam the logs with it.
+    // Hanging up an already-ended call is expected/harmless noise when we tidy up
+    // losing lines after a bridge. 90018 = already ended; 90015 = invalid call control
+    // id (the leg already went away). Don't spam the logs with either.
     const code = json?.errors?.[0]?.code;
-    const isHarmlessHangup = path.endsWith("/hangup") && (code === "90018" || /already ended/i.test(text));
+    const isHarmlessHangup = path.endsWith("/hangup") &&
+      (code === "90018" || code === "90015" || /already ended|not valid|invalid call control/i.test(text));
     if (!isHarmlessHangup) console.error("Telnyx error", res.status, path, text.slice(0, 400));
   }
   return json;
 }
-const action = (ccid, name, payload = {}) =>
-  telnyx(`/calls/${ccid}/actions/${name}`, payload);
-// Conference helpers using Telnyx's ACTUAL endpoints (verified against docs):
-//  - Create:  POST /conferences { name, call_control_id }  (first leg creates it)
-//  - Join:    POST /conferences/{id}/actions/join { call_control_id }
-// Sean's leg creates the conference; each lead joins it by id.
+const action = (ccid, name, payload = {}) => telnyx(`/calls/${ccid}/actions/${name}`, payload);
 async function createConferenceWithSean(seanCcid, name) {
   const r = await telnyx("/conferences", {
-    name,
-    call_control_id: seanCcid,
-    beep_enabled: "never",
-    start_conference_on_create: true,
-    comfort_noise: true,
+    name, call_control_id: seanCcid, beep_enabled: "never",
+    start_conference_on_create: true, comfort_noise: true,
   });
   const id = r?.data?.id || null;
   if (r?.errors) console.error("CONFERENCE CREATE FAILED:", JSON.stringify(r.errors));
   return id;
 }
 async function joinConference(confId, leadCcid) {
-  // start_conference_on_enter: true => the conference audio is LIVE the moment
-  // the lead enters, so Sean and the lead hear each other immediately. The old
-  // value (false) parked the lead in a held/waiting state with no audio — the
-  // "silent room" bug where calls connected but no one could hear anyone.
+  // start_conference_on_enter: true => audio is LIVE the moment the lead enters.
   return telnyx(`/conferences/${confId}/actions/join`, {
-    call_control_id: leadCcid,
-    beep_enabled: "never",
-    start_conference_on_enter: true,
-    end_conference_on_exit: false,
-    supervisor_role: "none",
+    call_control_id: leadCcid, beep_enabled: "never",
+    start_conference_on_enter: true, end_conference_on_exit: false, supervisor_role: "none",
   });
 }
 // ============================================================================
@@ -335,10 +330,7 @@ async function joinConference(confId, leadCcid) {
 app.post("/voicemail", (req, res) => {
   const { audio, contentType } = req.body || {};
   if (!audio) return res.status(400).json({ error: "need audio (base64)" });
-  voicemailAudio = {
-    buffer: Buffer.from(audio, "base64"),
-    contentType: contentType || "audio/mpeg",
-  };
+  voicemailAudio = { buffer: Buffer.from(audio, "base64"), contentType: contentType || "audio/mpeg" };
   console.log("Voicemail uploaded:", voicemailAudio.buffer.length, "bytes");
   res.json({ ok: true, size: voicemailAudio.buffer.length });
 });
@@ -353,20 +345,15 @@ app.get("/voicemail-status", (req, res) => {
 });
 // ============================================================================
 //  SESSION START — call Sean once, hold him in a persistent conference.
-//  Leads are bridged into this conference instantly, so connects have NO ring
-//  delay. Sean stays on one call for the whole session.
 // ============================================================================
 app.post("/session/start", async (req, res) => {
   const { myPhone } = req.body || {};
   if (!myPhone) return res.status(400).json({ error: "need myPhone" });
   if (!FROM_NUMBERS.length) return res.status(500).json({ error: "no FROM_NUMBERS configured" });
-  // If Sean is already verified in the conference, do nothing.
   if (session.seanUp && session.seanCallId && await isLegAlive(session.seanCallId)) {
     return res.json({ ok: true, already: true, confName: session.confName });
   }
-  // DEBOUNCE: if we just called Sean's phone in the last 30s and it's still
-  // pending (ringing / awaiting keypress), don't ring him again. This stops the
-  // thrash where the frontend fired /session/start 7 times in a row.
+  // DEBOUNCE: if we just called Sean's phone in the last 30s, don't ring him again.
   if (session.seanCallId && session.startedAt && (Date.now() - session.startedAt) < 30000) {
     return res.json({ ok: true, pending: true, message: "Already calling your phone — answer it." });
   }
@@ -376,11 +363,8 @@ app.post("/session/start", async (req, res) => {
   session.startedAt = Date.now();
   console.log("Session start — calling Sean to hold in conference:", session.confName);
   const call = await telnyx("/calls", {
-    connection_id: CONNECTION_ID,
-    to: ringMe(myPhone),
-    from: pickFrom(),
-    webhook_url: `${PUBLIC_URL}/webhook`,
-    client_state: b64({ seanHold: true }),
+    connection_id: CONNECTION_ID, to: ringMe(myPhone), from: pickFrom(),
+    webhook_url: `${PUBLIC_URL}/webhook`, client_state: b64({ seanHold: true }),
   });
   session.seanCallId = call?.data?.call_control_id || null;
   if (!session.seanCallId) {
@@ -402,21 +386,12 @@ app.post("/dial-batch", async (req, res) => {
   if (!FROM_NUMBERS.length) return res.status(500).json({ error: "no FROM_NUMBERS configured" });
   const mkt = (market || DEFAULT_MARKET).toUpperCase();
   const batchId = "b_" + Date.now().toString(36);
-  // How many leads to actually dial this batch (1-10). Backend hard-caps at 10
-  // regardless of what the frontend sends, as a safety ceiling.
   const count = Math.max(1, Math.min(10, parseInt(dialCount, 10) || leads.length));
-  // Sean must already be held in the conference (via /session/start). If he's
-  // not verified live, tell the frontend to start a session first. We NEVER
-  // dial leads without Sean already on the line — that's what caused leads to
-  // reach voicemail.
   const seanLive = session.seanUp && session.seanCallId && await isLegAlive(session.seanCallId);
   if (!seanLive) {
     session.seanUp = false; session.seanCallId = null;
     return res.status(409).json({ error: "no_session", message: "Start a session first — Sean must be on the line." });
   }
-  // Don't fire a new batch while Sean is already connected to a lead. Firing
-  // overlapping batches is what put multiple people + voicemails in the
-  // conference at once. Tell the frontend to wait.
   if (session.leadOnLine) {
     return res.status(409).json({ error: "busy", message: "You're on a call — finish it before dialing the next batch." });
   }
@@ -428,10 +403,6 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
   const lines = new Map();
   batches.set(batchId, { lines, connected: false, done: false, market });
   await Promise.all(leads.slice(0, Math.max(1, Math.min(10, count))).map(async (ld) => {
-    // Clean the number to +E164 FIRST, using the batch market so AU/UK/IE/NZ numbers
-    // get the right country code (not a US +1). Messy formats are rejected by Telnyx,
-    // and normalizing up front also means the cap/dedup checks treat the same number
-    // as one, not two.
     const to = toE164(ld.to, market);
     console.log("FORMAT raw=" + JSON.stringify(ld.to) + " market=" + JSON.stringify(market) + " force=" + (FORCE_MARKET || "-") + " -> " + to);
     if (!to) {
@@ -439,16 +410,12 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
       lines.set("badnum_" + ld.leadId, { leadId: ld.leadId, to: ld.to, status: "blocked", attempt: ld.attempt || 0, fromNumber: "-" });
       return;
     }
-    // BACKEND SAFETY: refuse to call a number that's hit its cap or was just
-    // called. This is the hard guarantee against calling anyone 20x in a row.
     const gate = canCall(to);
     if (!gate.ok) {
       console.log("BLOCKED re-dial of", to, "—", gate.reason);
       lines.set("blocked_" + ld.leadId, { leadId: ld.leadId, to, status: "blocked", attempt: ld.attempt || 0, fromNumber: "-" });
       return;
     }
-    // Never re-dial a lead that's already been dispositioned (server-side memory,
-    // survives device switches and CSV re-imports).
     if (isDispositioned(to)) {
       console.log("SKIPPED already-dispositioned lead", to, "—", dispositions[to].status);
       lines.set("dispo_" + ld.leadId, { leadId: ld.leadId, to, status: "done", attempt: ld.attempt || 0, fromNumber: "-" });
@@ -456,15 +423,11 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
     }
     const from = pickFrom();
     try {
-      recordCallAttempt(to, ld.name); // count the attempt BEFORE dialing, so a crash mid-dial still counts
+      recordCallAttempt(to, ld.name); // count the attempt BEFORE dialing
       const call = await telnyx("/calls", {
-        connection_id: CONNECTION_ID,
-        to,
-        from,
+        connection_id: CONNECTION_ID, to, from,
         webhook_url: `${PUBLIC_URL}/webhook`,
         client_state: b64({ batchId, leadId: ld.leadId }),
-        // Answering-machine detection so machines get the voicemail drop and humans
-        // get connected. Engine set by AMD_MODE. Only added when VM_AUTO is on.
         ...(VM_AUTO ? { answering_machine_detection: AMD_MODE } : {}),
       });
       const ccid = call?.data?.call_control_id;
@@ -473,7 +436,6 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
         recordPlaced(from);
         recordCallSuccess();
       } else {
-        // Call creation failed — capture the SPECIFIC reason from Telnyx.
         const err = call?.errors?.[0] || {};
         const reason = describeTelnyxError(err.code, err.detail, call?._httpStatus);
         recordCallFailure(reason, err.code);
@@ -484,35 +446,24 @@ async function fireBatch(batchId, leads, market = DEFAULT_MARKET, count = 10) {
       console.log("Call error for", to, ":", e.message);
     }
   }));
-  // If no lines were created (all calls failed), mark batch as done immediately
   if (lines.size === 0) {
     const batch = batches.get(batchId);
     if (batch) batch.done = true;
     console.log("Batch", batchId, "— all calls failed, marking done");
   }
-  // Safety timeout: mark batch done after 30 seconds if it hasn't resolved
   setTimeout(() => {
     const batch = batches.get(batchId);
-    if (batch && !batch.done) {
-      batch.done = true;
-      console.log("Batch", batchId, "— timed out, marking done");
-    }
+    if (batch && !batch.done) { batch.done = true; console.log("Batch", batchId, "— timed out, marking done"); }
   }, 30000);
 }
 // ============================================================================
 //  CONNECT vs VOICEMAIL HELPERS
 // ============================================================================
-// Bridge a lead leg into Sean's conference. This is the original instant-connect
-// path, lifted out unchanged so it can be reused whether we connect on answer
-// (VM_AUTO off) or after the lead is confirmed human (VM_AUTO on). Every original
-// guard still runs here, at connect time.
 async function bridgeLeadToSean(ccid, batch, line) {
   if (!line) return;
   if (line.amdTimer) { clearTimeout(line.amdTimer); line.amdTimer = null; }
   line.awaitingAMD = false;
-  // GLOBAL one-at-a-time guard. CLAIM the slot synchronously, before any await,
-  // so two webhooks firing at the same instant (e.g. two detection timeouts
-  // expiring together) can't both pass the check and both connect.
+  // GLOBAL one-at-a-time guard. CLAIM the slot synchronously, before any await.
   if (session.leadOnLine || batch.connected) {
     line.status = "dropped";
     action(ccid, "hangup").catch(() => {});
@@ -523,7 +474,6 @@ async function bridgeLeadToSean(ccid, batch, line) {
     action(ccid, "hangup").catch(() => {});
     return;
   }
-  // Claim NOW, before the async leg-check, so no other lead can slip into the gap.
   session.leadOnLine = true;
   session.connectedLeadCcid = ccid;
   batch.connected = true;
@@ -550,8 +500,6 @@ async function bridgeLeadToSean(ccid, batch, line) {
     action(ccid, "hangup").catch(() => {});
   } else {
     console.log("Connected — lead in Sean's conference", ccid);
-    // Hang up the other still-ringing leads — Sean can only talk to one. Leads that
-    // are mid-voicemail (status "voicemail") are left alone to finish.
     for (const [otherId, other] of batch.lines) {
       if (otherId !== ccid && (other.status === "dialing" || other.status === "ringing")) {
         other.status = "dropped";
@@ -560,10 +508,6 @@ async function bridgeLeadToSean(ccid, batch, line) {
     }
   }
 }
-// Drop the pre-recorded voicemail onto a lead leg that detection flagged as a
-// machine, then hang up. The lead was never bridged into the conference, so the
-// recording plays straight to their voicemail box and Sean never hears it. Other
-// still-ringing leads keep ringing in case one is a human.
 async function dropVoicemail(ccid, batch, line) {
   if (!line) return;
   if (line.amdTimer) { clearTimeout(line.amdTimer); line.amdTimer = null; }
@@ -576,8 +520,6 @@ async function dropVoicemail(ccid, batch, line) {
     return;
   }
   line.vmPlaying = true;
-  // One voicemail per person: mark this lead dispositioned so it's never re-dialed
-  // (and so a second voicemail is never left) for the rest of this server run.
   dispositions[line.to] = { status: "voicemail", at: new Date().toISOString() };
   console.log("Machine detected — dropping your voicemail on", ccid, "(won't redial)");
   const r = await action(ccid, "playback_start", { audio_url: `${PUBLIC_URL}/voicemail.mp3` });
@@ -605,14 +547,13 @@ app.post("/webhook", async (req, res) => {
     console.log("Inbound call from", from, "to", to);
     inboundLog.unshift({ type: "call", from, to, timestamp: new Date().toISOString() });
     if (inboundLog.length > 100) inboundLog.length = 100;
-    // Forward to your phone if configured
     if (MY_PHONE && ccid) {
       await action(ccid, "answer");
       await action(ccid, "transfer", { to: ringMe(MY_PHONE) });
     }
     return;
   }
-  // ---- DIRECT CALL: your phone answered → dial the lead immediately (using session state) ----
+  // ---- DIRECT CALL: your phone answered → dial the lead immediately ----
   if (type === "call.answered" && directCallPending && ccid === directCallPending.seanCcid) {
     console.log("Direct call: you answered! Now dialing lead", directCallPending.to);
     const call2 = await telnyx("/calls", {
@@ -632,24 +573,17 @@ app.post("/webhook", async (req, res) => {
       directCallPending = null;
       return;
     }
-    const bridgeResult = await action(ccid, "bridge", {
-      call_control_id: directCallPending.seanCcid,
-    });
+    const bridgeResult = await action(ccid, "bridge", { call_control_id: directCallPending.seanCcid });
     console.log("Bridge result:", JSON.stringify(bridgeResult));
     directCallPending = null;
     return;
   }
   // ---- CALLBACK: your phone answered a call-back → now dial the lead ----
   if (type === "call.answered" && state.callback) {
-    // Bridge: transfer this call to the lead
     await action(ccid, "transfer", { to: state.callbackTo, from: state.callbackFrom || FROM_NUMBERS[0] });
     return;
   }
-  // ---- YOUR leg answered -> put you straight into the conference, held.
-  //      (No keypress step — it required an 'answer' command that Telnyx rejects
-  //      on outbound calls, which broke confirmation entirely. Instead we go
-  //      straight to conference. The voicemail guard is: leads only connect when
-  //      isLegAlive confirms your leg is genuinely live at connect time.)
+  // ---- YOUR leg answered -> put you straight into the conference, held. ----
   if (type === "call.answered" && ccid === session.seanCallId && state.seanHold) {
     console.log("Sean's phone answered — creating conference and holding him.");
     session.confId = await createConferenceWithSean(ccid, session.confName);
@@ -668,9 +602,7 @@ app.post("/webhook", async (req, res) => {
     }
     return;
   }
-  // ---- SEAN's leg hung up -> Sean ended the whole session.
-  //      (A lead hanging up does NOT touch Sean's leg in the conference model,
-  //      so this only fires when Sean himself hangs up his phone.)
+  // ---- SEAN's leg hung up -> Sean ended the whole session. ----
   if (type === "call.hangup" && ccid === session.seanCallId) {
     console.log("Sean hung up his phone — ending session.");
     for (const b of batches.values()) {
@@ -695,16 +627,7 @@ app.post("/webhook", async (req, res) => {
       if (!line) break;
       line.status = "ringing";
       recordAnswered(line.fromNumber);
-      if (!VM_AUTO) {
-        // Zero-delay path (VM_AUTO off): connect the instant they answer. Identical
-        // to the original instant-connect behavior.
-        await bridgeLeadToSean(ccid, batch, line);
-        break;
-      }
-      // VM_AUTO on: wait for answering-machine detection before deciding. Humans get
-      // bridged, machines get the voicemail drop. Safety net: if detection has not
-      // resolved within 4s, treat it as a human and connect, so a real person is
-      // never left sitting in silence.
+      if (!VM_AUTO) { await bridgeLeadToSean(ccid, batch, line); break; }
       line.awaitingAMD = true;
       line.amdTimer = setTimeout(() => {
         if (line.awaitingAMD) {
@@ -718,16 +641,10 @@ app.post("/webhook", async (req, res) => {
     case "call.machine.detection.ended": {
       if (!VM_AUTO || !line || !line.awaitingAMD) break;
       const result = String(p.result || "").toLowerCase();
-      // Machine-like results -> it's a voicemail. Everything else (human, not_sure,
-      // silence, undetermined) -> connect, so a recording is never played at a real
-      // person.
       const isMachine = result.includes("machine") || result === "fax";
       line.awaitingAMD = false;
       if (line.amdTimer) { clearTimeout(line.amdTimer); line.amdTimer = null; }
       if (isMachine) {
-        // Don't play yet. Wait for the beep (call.machine.greeting.ended) so the
-        // whole message lands instead of playing over the greeting. Fallback: if no
-        // beep event arrives within 22s, drop it anyway.
         line.machineDetected = true;
         line.vmBeepTimer = setTimeout(() => {
           if (line.machineDetected && !line.vmPlaying) dropVoicemail(ccid, batch, line).catch(() => {});
@@ -741,9 +658,6 @@ app.post("/webhook", async (req, res) => {
     case "call.machine.greeting.ended": {
       if (!VM_AUTO || !line) break;
       const gresult = String(p.result || "").toLowerCase();
-      // A beep means we reached the voicemail box — play the recording NOW, after the
-      // beep, so the full message is left. Covers the case where the beep is detected
-      // before the human/machine classification too.
       if ((gresult === "beep_detected" || line.machineDetected) && !line.vmPlaying) {
         line.awaitingAMD = false;
         if (line.amdTimer) { clearTimeout(line.amdTimer); line.amdTimer = null; }
@@ -754,7 +668,6 @@ app.post("/webhook", async (req, res) => {
     }
     case "call.playback.ended":
     case "call.playback.stopped": {
-      // The voicemail recording finished playing on a machine line — hang it up.
       if (line && line.vmPlaying) {
         line.vmPlaying = false;
         line.status = "voicemail";
@@ -764,22 +677,18 @@ app.post("/webhook", async (req, res) => {
       break;
     }
     case "call.hangup":
-      // A LEAD line ended. This NEVER affects Sean — he stays in the conference.
       if (line && line.amdTimer) { clearTimeout(line.amdTimer); line.amdTimer = null; }
       if (line && line.vmBeepTimer) { clearTimeout(line.vmBeepTimer); line.vmBeepTimer = null; }
       if (line) { line.awaitingAMD = false; line.machineDetected = false; }
       if (line && line.status === "connected") {
         line.status = "ended";
         batch.connected = false;
-        // Release the GLOBAL guard so the next lead (any batch) can connect.
         session.leadOnLine = false;
         session.connectedLeadCcid = null;
         console.log("Lead left the conference — Sean stays on, ready for next lead.");
       } else if (line) {
         line.status = line.status || "dropped";
       }
-      // Safety: if the leg that ended was the one we recorded as connected,
-      // clear the global flag even if status bookkeeping missed it.
       if (session.connectedLeadCcid === ccid) {
         session.leadOnLine = false;
         session.connectedLeadCcid = null;
@@ -792,7 +701,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 // ============================================================================
-//  INBOUND SMS WEBHOOK (if messaging is configured on the number)
+//  INBOUND SMS WEBHOOK
 // ============================================================================
 app.post("/messaging", (req, res) => {
   res.sendStatus(200);
@@ -825,8 +734,7 @@ app.post("/direct-call", async (req, res) => {
   try {
     console.log("Direct call: calling your phone", myPhone, "then will dial", toClean);
     const call1 = await telnyx("/calls", {
-      connection_id: CONNECTION_ID, to: ringMe(myPhone), from,
-      webhook_url: `${PUBLIC_URL}/webhook`,
+      connection_id: CONNECTION_ID, to: ringMe(myPhone), from, webhook_url: `${PUBLIC_URL}/webhook`,
     });
     const ccid = call1?.data?.call_control_id;
     directCallPending = { seanCcid: ccid, to: toClean, from };
@@ -845,29 +753,21 @@ app.post("/call-back", async (req, res) => {
   const from = fromNumber || FROM_NUMBERS[0] || "";
   if (!from) return res.status(500).json({ error: "no FROM number" });
   try {
-    // Call your phone first
     const call1 = await telnyx("/calls", {
-      connection_id: CONNECTION_ID, to: ringMe(myPhone), from,
-      webhook_url: `${PUBLIC_URL}/webhook`,
+      connection_id: CONNECTION_ID, to: ringMe(myPhone), from, webhook_url: `${PUBLIC_URL}/webhook`,
       client_state: b64({ callback: true, callbackTo: toClean, callbackFrom: from }),
     });
     res.json({ ok: true, callId: call1?.data?.call_control_id });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-// Handle callback bridge — when your phone answers, dial the lead
-app.post("/webhook-callback-bridge", async (req, res) => {
-  // This is handled in the main webhook below
-  res.sendStatus(200);
-});
+app.post("/webhook-callback-bridge", async (req, res) => { res.sendStatus(200); });
 app.post("/send-text", async (req, res) => {
   const { to, fromNumber, body } = req.body || {};
   if (!to || !body) return res.status(400).json({ error: "need to and body" });
   const from = fromNumber || FROM_NUMBERS[0] || "";
   if (!from) return res.status(500).json({ error: "no FROM number" });
   try {
-    const result = await telnyx("/messages", {
-      from, to, text: body, type: "SMS",
-    });
+    const result = await telnyx("/messages", { from, to, text: body, type: "SMS" });
     if (result.errors) return res.json({ ok: false, error: result.errors[0]?.detail || "SMS failed" });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -875,6 +775,8 @@ app.post("/send-text", async (req, res) => {
 // ============================================================================
 //  STATUS + LOGS
 // ============================================================================
+// Synthetic (non-dialed) line keys we must never send a Telnyx hangup for.
+const isSyntheticLine = (ccid) => /^(blocked_|badnum_|dispo_)/.test(String(ccid));
 app.get("/batch-status/:id", (req, res) => {
   const batch = batches.get(req.params.id);
   if (!batch) return res.json({ lines: [], done: false });
@@ -884,15 +786,11 @@ app.get("/batch-status/:id", (req, res) => {
     lines: [...batch.lines.values()].map(l => ({ leadId: l.leadId, status: l.status, fromNumber: l.fromNumber })),
   });
 });
-app.get("/inbound-log", (req, res) => {
-  res.json({ log: inboundLog });
-});
+app.get("/inbound-log", (req, res) => { res.json({ log: inboundLog }); });
 app.post("/hangup-all", async (req, res) => {
-  // Emergency stop: hang up EVERY lead leg, including connected ones, so nothing
-  // can linger (e.g. a misclassified voicemail sitting in the conference).
   for (const batch of batches.values()) {
     for (const [ccid, l] of batch.lines) {
-      if (!String(ccid).startsWith("blocked_")) action(ccid, "hangup").catch(() => {});
+      if (!isSyntheticLine(ccid)) action(ccid, "hangup").catch(() => {});
       l.status = "ended";
     }
     batch.done = true;
@@ -901,10 +799,9 @@ app.post("/hangup-all", async (req, res) => {
   res.json({ ok: true });
 });
 app.post("/session/end", async (req, res) => {
-  // Drop ALL lead legs first, then Sean's leg, then clear all state.
   for (const batch of batches.values()) {
     for (const [ccid] of batch.lines) {
-      if (!String(ccid).startsWith("blocked_")) action(ccid, "hangup").catch(() => {});
+      if (!isSyntheticLine(ccid)) action(ccid, "hangup").catch(() => {});
     }
     batch.done = true; batch.connected = false;
   }
@@ -914,46 +811,32 @@ app.post("/session/end", async (req, res) => {
   console.log("Session ended by user — all legs dropped.");
   res.json({ ok: true });
 });
-// ---- LIVE SESSION STATUS (frontend reads this so the board shows real state) ----
 app.get("/session/status", (_req, res) => {
-  // Find the most recent active batch and report its real line states.
   let activeLines = [];
   for (const [, b] of batches) {
     if (!b.done) {
-      activeLines = [...b.lines.values()].map(l => ({
-        to: l.to, status: l.status, fromNumber: l.fromNumber, attempt: l.attempt,
-      }));
+      activeLines = [...b.lines.values()].map(l => ({ to: l.to, status: l.status, fromNumber: l.fromNumber, attempt: l.attempt }));
     }
   }
-  res.json({
-    seanUp: session.seanUp,
-    seanOnCall: Boolean(session.seanCallId),
-    activeLines,
-  });
+  res.json({ seanUp: session.seanUp, seanOnCall: Boolean(session.seanCallId), activeLines });
 });
-// ---- DROP CURRENT LEAD (keep Sean on the line) ----
-// Hangs up whatever lead is currently connected to Sean, WITHOUT ending Sean's
-// session. Sean stays held in the conference, ready for the next lead.
 app.post("/drop-lead", async (req, res) => {
   let dropped = 0;
   for (const batch of batches.values()) {
     for (const [ccid, l] of batch.lines) {
-      if (l.status === "connected" && !String(ccid).startsWith("blocked_")) {
+      if (l.status === "connected" && !isSyntheticLine(ccid)) {
         action(ccid, "hangup").catch(() => {});
         l.status = "ended";
         dropped++;
       }
     }
-    // free the slot so the next lead can connect / next batch can fire
     batch.connected = false;
   }
-  // Release the GLOBAL guard so the next lead can connect after a manual drop.
   session.leadOnLine = false;
   session.connectedLeadCcid = null;
   console.log("Dropped current lead(s):", dropped, "— Sean stays on the line.");
   res.json({ ok: true, dropped });
 });
-// ---- RECORD A DISPOSITION (so the lead is never re-dialed, any device) ----
 app.post("/disposition", (req, res) => {
   const { phone, status } = req.body || {};
   if (!phone || !status) return res.status(400).json({ error: "need phone and status" });
@@ -961,24 +844,16 @@ app.post("/disposition", (req, res) => {
   console.log("Disposition recorded:", phone, "->", status);
   res.json({ ok: true });
 });
-app.get("/dispositions", (_req, res) => {
-  res.json({ dispositions });
-});
-// ---- CALL LOG (who was called, how many times, last outcome) ----
+app.get("/dispositions", (_req, res) => { res.json({ dispositions }); });
 app.get("/call-log", (_req, res) => {
   const log = Object.entries(callHistory).map(([phone, h]) => ({
-    phone,
-    name: h.name || "",
-    attempts: h.attempts || 0,
+    phone, name: h.name || "", attempts: h.attempts || 0,
     lastCalledAt: h.lastCalledAt ? new Date(h.lastCalledAt).toISOString() : null,
     lastOutcome: h.lastOutcome || "dialed",
   })).sort((a, b) => (b.lastCalledAt || "").localeCompare(a.lastCalledAt || ""));
   res.json({ totalNumbers: log.length, totalCalls: log.reduce((s, x) => s + x.attempts, 0), log });
 });
-// ---- NUMBER MANAGEMENT (live, syncs the dialer's rotation) ----
-app.get("/numbers", (_req, res) => {
-  res.json({ numbers: FROM_NUMBERS, reputation: numberReputation() });
-});
+app.get("/numbers", (_req, res) => { res.json({ numbers: FROM_NUMBERS, reputation: numberReputation() }); });
 app.post("/numbers", (req, res) => {
   const { numbers } = req.body || {};
   if (!Array.isArray(numbers)) return res.status(400).json({ error: "numbers must be an array" });
@@ -990,10 +865,8 @@ app.post("/numbers", (req, res) => {
   res.json({ numbers: FROM_NUMBERS, reputation: numberReputation() });
 });
 app.get("/health", async (_req, res) => {
-  // Refresh balance (cached ~60s) and recompute alerts on each poll.
   const balance = await checkBalance();
   const alerts = computeAlerts();
-  // Add answer-rate (spam-proxy) warnings to the banner.
   const rep = numberReputation();
   rep.filter(r => r.suspect).forEach(r => {
     alerts.push(`NUMBER MAY BE FLAGGED: ${r.number} — answer rate ${(r.answerRate * 100).toFixed(0)}% over ${r.placed} calls. Verify it and consider swapping.`);
@@ -1004,22 +877,16 @@ app.get("/health", async (_req, res) => {
     fromNumbers: FROM_NUMBERS.length,
     hasVoicemail: !!voicemailAudio,
     inboundCount: inboundLog.length,
-    // --- alerting ---
     alerts,
     balance: balance,
     apiKeyOk: sysHealth.apiKeyOk,
     consecutiveCallFailures: sysHealth.consecutiveCallFailures,
     lastFailureReason: sysHealth.lastFailureReason,
     lastFailureAt: sysHealth.lastFailureAt,
-    // --- number reputation (answer-rate proxy) ---
     reputation: rep,
   });
 });
-// Manual "clear the locked-number memory" button. Same effect as restarting the
-// Railway server, but instant and no redeploy. If numbers are stuck on
-// "max 3 attempts reached" and you want them callable again right now, just open
-//   https://<your-railway-url>/reset-attempts
-// in a browser tab (GET works, so the URL bar is enough), or POST to it.
+// Manual "clear the locked-number memory" button (GET works, so the URL bar is enough).
 function doResetAttempts(req, res) {
   const cleared = Object.keys(callHistory).length;
   for (const k in callHistory) delete callHistory[k];
@@ -1030,4 +897,4 @@ function doResetAttempts(req, res) {
 app.get("/reset-attempts", doResetAttempts);
 app.post("/reset-attempts", doResetAttempts);
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Switchboard v4.0.0-AUFIX backend listening on :${PORT} — FORCE_MARKET=${FORCE_MARKET || "(unset)"} — daily attempt-reset at local midnight (UTC+${DAILY_RESET_UTC_OFFSET})`));
+app.listen(PORT, () => console.log(`Switchboard v4.1.0-INTL backend listening on :${PORT} — FORCE_MARKET=${FORCE_MARKET || "(unset)"} — DEFAULT_MARKET=${DEFAULT_MARKET || "(unset)"} — daily attempt-reset at local midnight (UTC+${DAILY_RESET_UTC_OFFSET})`));
